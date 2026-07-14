@@ -1,0 +1,4 @@
+interface:
+  display_name: "Relocate Codex Project"
+  short_description: "Safely move Codex projects without losing tasks"
+  default_prompt: "Use $relocate-codex-project to safely move this Codex project to a new local folder."
