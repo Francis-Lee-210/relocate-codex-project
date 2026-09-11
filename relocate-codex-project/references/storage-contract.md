@@ -1,44 +1,75 @@
-# Codex storage contract
+# Codex integration contract
 
-Use this reference only to interpret or apply the metadata branch. These are private Codex implementation details observed on macOS on 2026-07-14; treat a schema mismatch as a stop signal.
+Read this reference when interpreting the metadata audit, updating project associations, or deciding whether the compatibility link can be removed.
 
-## Active stores
+## Ownership and supported scope
 
-`~/.codex/state_5.sqlite` is the current thread catalog. The tested schema ends at `_sqlx_migrations.version = 40` and exposes:
+The helper performs physical folder renames and moves on the same filesystem. Its `plan` and `verify` commands inspect Codex metadata through stable, read-only snapshots; they never write Codex databases, global state, permission profiles, or session history. Filesystem rollback restores the directory/link state, not application changes made afterward.
 
-- `threads.cwd`: current task working directory;
-- `threads.sandbox_policy`: JSON containing typed filesystem entries;
-- `threads.rollout_path`: session JSONL location, not a project path to rewrite. For every related task, it must resolve to a real contained JSONL whose first-record thread ID matches.
+Use the desktop's **Edit project** flow to attach the new path to the existing project. Preserve its canonical project ID, the ordered root list, and which root is primary. Replace the affected root without recreating the project or changing unrelated roots. The desktop updates its project storage and cache together. **Make primary** changes the default working directory for new tasks; it is not evidence that historical task settings changed. [Official project guidance](https://learn.chatgpt.com/docs/projects#use-local-projects-for-folders-and-codebases).
 
-`~/.codex/.codex-global-state.json` holds independent desktop and permission state.
+Keep the default old-path compatibility link until the acceptance checks below pass. Stop affected running tasks and processes before the physical move, as required by the main workflow.
 
-Session JSONL files under `sessions/` and `archived_sessions/` begin with `session_meta`; `session_meta.payload.cwd` is the only historical record this skill updates.
+## Read-only metadata audit
 
-`session_index.jsonl` contains task names rather than project paths. The nested `~/.codex/sqlite/state_5.sqlite`, backups, temporary files, logs, shell snapshots, and memories are audit-only.
+Discover the active state schema and available fields rather than assuming a historical migration number grants write compatibility. Modern state includes:
 
-## Write allowlist
+- `projects` and ordered `project_roots`: canonical identity and attached directories;
+- `threads.project_id`, `threads.cwd`, `threads.archived`, and `threads.sandbox_policy`: association, current working directory, archive status, and effective stored permissions;
+- `threads.rollout_path`: the history location, not a project path to relocate;
+- `.codex-global-state.json`: desktop `local-projects`, legacy/canonical identity mappings, and independent root or permission hints.
 
-Update a path only when it equals the literal old path or begins with `old + os.sep` inside one of these structured fields:
+Inspect all affected active and archived tasks. Match the exact old path or a descendant separated by a path boundary; preserve unrelated paths. Treat malformed, ambiguous, unsupported, or changing inputs as an incomplete audit. Read a stable temporary copy of the database and WAL so SQLite cannot alter the real SHM or recover the real store. A raw text search is not an effective-settings audit.
 
-- `threads.cwd`;
-- `threads.sandbox_policy.file_system.entries[*].path.path` when `path.type == "path"`;
-- global-state workspace-root lists, project ordering/pinning, workspace labels, thread root hints, thread writable roots, and heartbeat sandbox writable roots;
-- the first JSONL record's `session_meta.payload.cwd`.
+A stale desktop cache and an updated database can coexist. Local source inspection found that the desktop's project update calls both `project/update` and its cache updater. Startup loads server projects into identity maps; it does not establish that an external native update will refresh `local-projects`. Verify both representations after desktop editing.
 
-Preserve relative suffixes such as `.git`, `.agents`, and `.codex`. Keep unrelated writable roots and pre-existing duplicates. Remove only a collision introduced when an allowlisted old path transforms into a new path that is already present, and report that removal as its own planned action.
+## Native API boundary
 
-## Historical boundary
+A schema describes a capability, not an authorized connection to the user's desktop. Use native methods only through a channel already verified to target the current host, its active server, and the intended project/task IDs. Keep the desktop/cache synchronization requirement even when a native method succeeds.
 
-Treat `world_state`, `turn_context`, `thread_settings`, messages, tool inputs and outputs, and other event records as historical snapshots. They may truthfully mention the old path, and their values remain unchanged. A residual textual match outside the allowlist is not a repair instruction.
+Do not launch a separate app-server against the real Codex home to perform offline updates. Do not invent a socket path or treat `app-server proxy` as a universal attachment mechanism. Its `--sock` option targets a running control socket; attachment to this desktop's existing server was not verified. When a suitable channel is unavailable, use desktop editing and retain compatibility support.
 
-Session JSONL editing is surgical: read at most the 8 MiB first-record limit, rewrite only `session_meta.payload.cwd`, and stream-copy every later byte unchanged. An oversized first record blocks the audit. Global state and sandbox policies are parsed with duplicate-key, non-standard-number, non-finite-number, and precision-losing-number rejection, then normalized with ASCII-safe JSON escapes; non-allowlisted JSON values remain semantically unchanged, but whitespace and escape spelling are not a byte-for-byte contract. Valid escaped lone surrogates remain escaped rather than becoming invalid UTF-8.
+Generate version-specific protocol schemas in a temporary directory when needed. Isolated experiments may use a temporary Codex home and synthetic tasks; they are not a production migration route. [Official App Server schema and transport guidance](https://learn.chatgpt.com/docs/app-server#message-schema).
 
-## Transaction boundary
+| Method | Verified meaning and boundary |
+| --- | --- |
+| `project/update {projectId, roots}` | Replaces the project's roots and persists them. Does not update task cwd. Supply the complete intended ordered roots; preserve the existing ID. |
+| `thread/metadata/update {threadId, projectId}` | Updates task association. Omission leaves it unchanged; an empty string clears it. Verified for stored, unloaded and archived tasks, preserving archive status. |
+| `thread/settings/update {threadId, cwd}` | Updates subsequent-turn settings for a loaded task. An unloaded task returns `thread not found`; it must first be resumed through the verified host channel. |
+| `thread/resume {threadId, cwd, runtimeWorkspaceRoots}` | Loads an existing task and accepts cwd and absolute runtime-root overrides. Use the existing thread ID, not replacement history. |
+| Archived-task resume | Fails until the task is unarchived. Preserve archive status; do not silently unarchive every historical task to force a migration. |
+| Active tasks | A running turn is not a migration target. Finish or stop the affected work through the normal task controls before changing its filesystem or settings. |
 
-Use the root `state_5.sqlite` when present; treat a distinct nested copy as legacy. `--state-db` may only confirm the same file identity as the automatically selected root or legacy database; it cannot override that selection. A candidate path occupied by a directory or other non-file node is ambiguous and blocks the operation. Require the active database, global state, sessions, and SQLite sidecars to be real files contained in a real `CODEX_HOME`; refuse symlinks and external explicit database paths.
+## Permissions and history
 
-Treat missing or malformed active stores as an incomplete audit. A malformed unrelated session first record may remain a warning only when it does not contain the literal or JSON-escaped old path. Do not create an apply token until the audit is complete and migration 40 is confirmed.
+Keep managed permission profiles in their native representation. The observed store uses `type: managed` with typed filesystem entries, network restrictions, and read carveouts for `.git`, `.agents`, and `.codex`. The RPC `SandboxPolicy` legacy union is not a lossless representation. Never convert managed permissions to a broad legacy workspace/full-access policy to make an update succeed.
 
-Read planning and verification data from a stable temporary copy of the database plus WAL so SQLite never creates or updates the real SHM. Normalize that temporary copy to standalone DELETE-journal mode. A present rollback `-journal` blocks planning because its recovery state is ambiguous; bind its absent state into the token so one cannot appear before mutation. Back up SQLite from the same kind of snapshot with its backup API so WAL content is consistent, and complete all backups before the project directory is renamed. Check open handles on the database, WAL, SHM, and any rollback journal fail-closed. Update only the exact token-approved row and field action set with parameterized SQL in one transaction and require `integrity_check = ok`.
+The built-in `:workspace` profile passed one isolated test: changing only cwd preserved its managed restrictions and moved the write root and read carveouts to the new path. This does not prove preservation of arbitrary custom entries or profiles. Verify their effective roots and restrictions individually; retain the link when exact preservation is unresolved.
 
-Write ordinary files through a same-directory temporary file, `fsync`, and atomic replace. Fsync every backup file, the backup directory tree, and the parent directory entries before renaming the project. Fsync both rename parents and the compatibility-link parent; a failed sync is a recoverable partial state, and token replay must retry those syncs before metadata can commit. Bind metadata-only repair approval to the destination device/inode and filesystem state. Recheck that binding after backup, immediately before metadata writes, during multi-store repair, and again before reporting completion; use the normal apply token's source identity for the same guards after a move. Recheck each metadata fingerprint immediately before replacement, require the applied count to equal the planned count, and finish with a clean full audit. Keep a manifest and SHA-256 for every backup. A running process holding the database or any sidecar makes the transaction unsafe; quit Codex and create a fresh token.
+A successful settings response can precede persistence. Require stored readback and the next resume to show the intended cwd, runtime roots, project association, and permissions before marking a task direct. A `{}` response, notification, sidebar label, or visible task alone is insufficient.
+
+Historical `session_meta.cwd`, `turn_context`, environment messages, and tool output may correctly contain the old path. Native settings updates append `event_msg.thread_settings_applied`; they do not need to rewrite old records. Leave all JSONL history intact. Inspect effective settings and subsequent resume behavior instead of replacing historical strings.
+
+## Acceptance and compatibility
+
+Record the project association and each affected task separately:
+
+- **Direct:** the saved project uses the intended new roots, and the task's persisted settings plus next resume use the new path with the intended permissions. Verify actual access from that resumed task.
+- **Compatibility-dependent:** the old literal path still appears in effective settings but resolves through the verified old-to-new link. This may keep the task working; record that dependency explicitly and retain the link.
+- **Unverified or blocked:** association, root resolution, permissions, or task continuation lacks evidence. Do not promote this to direct because the folder exists or the sidebar looks correct.
+
+Remove the link only when every affected dependency, including archived tasks and permission hints, has been resolved and direct access verified. An archived task that has not been resumed remains unverified for continuation. Preserve the link and report that state rather than rewriting history or relaxing permissions.
+
+## Evidence baseline
+
+Observed on macOS on **2026-09-11**, desktop **26.903.71938**, bundled CLI **0.153.4**. These are tested versions, not a promise about later releases.
+
+An isolated temporary Codex home used `thread/start` and `thread/inject_items` to create a durable synthetic task, without `turn/start`, a model request, or copying real credentials. The experiment physically renamed its temporary folder and established:
+
+1. Project root updates survived a fresh app-server process; the task cwd stayed unchanged until separately updated.
+2. Loaded-task cwd updates persisted through an appended settings event; immediate readback could still be stale.
+3. A later process resumed without overrides and returned the new cwd, runtime roots, and preserved built-in managed profile.
+4. Original history retained the old cwd; the current database and resumed task used the new cwd.
+5. Archived metadata updates succeeded without unarchiving; archived resume failed explicitly.
+
+No real-project relocation, live desktop cache synchronization, custom-profile migration, or resumed model/tool execution was exercised by that experiment. Those remain per-migration acceptance checks.

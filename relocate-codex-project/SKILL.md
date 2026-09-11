@@ -1,100 +1,66 @@
 ---
 name: relocate-codex-project
-description: Relocate local Codex project folders transactionally. Use when a user wants to rename or move a project created from an existing folder, repair missing or mis-grouped tasks after its path changed, or verify a completed relocation.
+description: Rename or move a local Codex project folder while preserving its project identity, existing tasks, and file access. Use for physical folder path changes and recovery or verification of a move recorded by this skill; skip sidebar-only renaming and ordinary file organization.
 ---
 
 # Relocate Codex Project
 
-Treat the filesystem path, Codex thread catalog, desktop state, and session metadata as one transaction. Use `scripts/relocate.py` for every inspection and mutation.
+Treat rename, location move, and both together as one operation: **old absolute path → new absolute path**. Preserve the same project and task IDs, unrelated project roots, archive status, permissions, and history.
 
-## Guardrails
+The helper moves the filesystem and audits Codex through read-only snapshots. Update application settings through the desktop's **Edit project** flow. Never write Codex's SQLite, desktop JSON, or session JSONL directly. The directory move and application update are separate recoverable stages; success requires checking both.
 
-- Keep `plan` and `verify` read-only; run them inside Codex when useful.
-- Run `apply` and mutating `repair` only from Terminal after Codex has quit. The script must report no process holding the active state database.
-- Preserve the old path with the default compatibility symlink until end-to-end verification passes.
-- Match literal stored paths while auditing metadata; resolve filesystem paths separately.
-- Modify only the script's allowlisted structured fields. Preserve historical message and snapshot values; preserve every session JSONL byte after the first `session_meta` record. Global-state JSON may be normalized and reserialized, but non-allowlisted values must remain semantically unchanged.
-- Stop on `blocked`, `unsafe-refused`, an incomplete audit, an untested schema, ambiguous directories, an occupied destination, or a stale token. Resolve the reported condition and create a fresh plan.
+## 1. Establish the paths and plan
 
-## 1. Establish the transaction
+Resolve the exact source, destination, and local Codex home from the request and current environment. A display-name change alone uses the app's ordinary rename control and needs no folder relocation.
 
-Identify the literal old absolute path and the intended new absolute path. Run:
+Use `scripts/relocate.py plan` and save its JSON in a private, durable file outside both paths and Codex home. Use a new filename; retain the original plan through recovery and verification.
 
 ```bash
-python3 <skill-dir>/scripts/relocate.py plan "<old>" "<new>"
+python3 "<skill-dir>/scripts/relocate.py" plan "<old-absolute-path>" "<new-absolute-path>" > "<record-directory>/relocation.plan.json"
 ```
 
-Read the filesystem state, every planned metadata change, all warnings, and the `apply_token`. Explain them to the user before requesting approval.
+The helper requires Python 3.10+, `lsof`, and a supported macOS/Linux no-replace rename primitive. It supports same-filesystem directory moves with an old-to-new compatibility symlink. Cross-volume moves, case/Unicode-only renames, nested destinations, linked Git worktrees/submodules, repositories managing external worktrees, and relative symlinks whose destination would change need a separate procedure. A blocked plan is not permission to substitute a recursive copy or a plain overwriting `mv`.
 
-When metadata changes are listed, read `references/storage-contract.md` completely before interpreting them.
+Review `status`, blockers, filesystem identity, affected projects/tasks (including archived tasks), ordered `native_steps`, and compatibility dependencies. Read [storage-contract.md](references/storage-contract.md) when interpreting identity mappings, permissions, or API behavior. Unknown schemas or missing catalog evidence stop the automatic move; a migration number alone is not compatibility proof.
 
-Complete this step only when both paths are exact, the state is `ready` or `repair-only`, and every warning has a stated disposition.
+Proceed when the plan is `ready`, the paths match the user's request, and existing authorization covers this move. Ask only for missing choices or authorization; do not repeat approval already given for these exact paths. The plan checksum detects accidental edits, not user consent or a frozen content snapshot.
 
-## 2. Select the branch
+## 2. Move the folder
 
-- `initial`: continue with a normal relocation.
-- `linked`: use metadata repair if changes remain; otherwise verify.
-- `destination-only-unverified`: prefer the original `apply_token` to resume. Without that proof, repair metadata only after the user independently confirms the destination identity, then verify with `--without-link`.
-- `unsafe-refused` or any other state: keep the filesystem unchanged and resolve the blocker.
-
-Complete this step only when exactly one branch applies.
-
-## 3. Execute a normal relocation
-
-Obtain explicit approval for the exact old path, new path, compatibility-link policy, and listed metadata changes. Then instruct the user to:
-
-1. Quit every Codex window.
-2. Open Terminal.
-3. Rerun `plan` to obtain a fresh token after shutdown.
-4. Run:
+Stop affected turns, terminals, development servers, and scheduled work that can use the source. Run the helper from a neutral working directory outside the moved tree. If this task itself keeps the source busy, prepare the exact command and arrange execution from outside it; use a user-run Terminal step only when the available tools cannot do that safely. The helper's `lsof` check is a point-in-time check, so keep that work stopped through the application update.
 
 ```bash
-python3 <skill-dir>/scripts/relocate.py apply "<old>" "<new>" --token "<fresh-apply-token>"
+python3 "<skill-dir>/scripts/relocate.py" apply --plan "<absolute-plan-path>"
 ```
 
-Use `--without-link` in both commands only when the user explicitly accepts losing old-path compatibility.
+`apply` rechecks affected state and directory identity, saves a receipt beside the plan, uses an atomic no-replace rename, and creates the compatibility symlink. Keep the plan, receipt, and link. Its successful result is **filesystem-moved-native-update-pending**; it does not mean the project migration is complete.
 
-The script must finish and validate the metadata backup before it renames the project directory. A backup-preparation failure is a stop condition and must leave the project at the old path.
+For any interruption, unexpected path state, or recovery request, read [recovery.md](references/recovery.md) before further mutations. Do not generate a replacement plan to adopt a directory that has already moved.
 
-Complete this step only when `apply` reports `completed` or `already-complete`. For `partial-recoverable`, read `references/recovery.md` completely and resume from the diagnosed disk state.
+## 3. Update the same Codex project
 
-## 4. Repair an earlier relocation
+Use the native desktop **Edit project** flow for every project listed in `native_steps`. Add the replacement folder before removing the old folder if the UI requires at least one root. Preserve the complete intended root order and primary root, substituting only old-path roots and descendants. Keep the existing project ID; creating a new project does not preserve the original association.
 
-Run a read-only repair plan:
+Read back the saved roots and original task grouping. The new path must appear in both the desktop project and the native project catalog. A label change or successful root update does not establish that existing tasks changed their cwd.
+
+When a verified control channel to the current desktop/host supports task settings, follow [storage-contract.md](references/storage-contract.md) for current APIs and persistence checks. Otherwise retain compatibility for existing tasks and report it. Starting a separate app-server against the real Codex home is not a verified attachment to the desktop. Do not broaden a permission profile or unarchive all tasks to force a direct migration.
+
+## 4. Verify continuity
 
 ```bash
-python3 <skill-dir>/scripts/relocate.py repair "<old>" "<new>"
+python3 "<skill-dir>/scripts/relocate.py" verify --plan "<absolute-plan-path>"
 ```
 
-Before interpreting or applying metadata changes, read `references/storage-contract.md` completely. Show the user every file, thread ID, JSON pointer, old value, and new value. Record the top-level `repair_apply_token`, which binds both the metadata snapshot and destination directory identity. After approval, have the user quit Codex, rerun the repair plan from Terminal, and apply its fresh token:
+Resolve every reported conflict and pending project update before runtime acceptance. `ready-for-runtime-check` means the filesystem/catalog audit passed; the helper does not execute tasks or certify effective permission enforcement.
 
-```bash
-python3 <skill-dir>/scripts/relocate.py repair "<old>" "<new>" --token "<fresh-repair-apply-token>"
-```
+Verify in the desktop that the same project contains its expected tasks. Continue representative existing tasks through their normal controls, including each distinct affected permission configuration, and observe their effective cwd and intended read access. Where the profile permits writing, exercise an authorized reversible write within the workspace; for read-only tasks, verify the expected write restriction. Check required read-only carveouts and unrelated roots remain intact. Do not create replacement tasks as evidence that the old ones work.
 
-Complete this step only when repair reports `completed` or `already-complete`, or a fresh repair plan reports `clean`, and a backup location is recorded for every actual mutation.
+Report the result per affected task:
 
-## 5. Verify end to end
+- **Direct:** persisted settings and a subsequent resume use the new path, with actual intended access verified.
+- **Compatibility-dependent:** effective settings still use the old path through the verified link; state whether continuation was exercised.
+- **Unverified:** runtime access or continuation was not exercised, including untouched archived tasks.
 
-After Codex restarts, run:
+Preserve archived status and historical JSONL. Keep the compatibility link while any dependency or unverified task remains; the helper deliberately has no link-removal option. Removal needs a separate, fully evidenced cleanup decision.
 
-```bash
-python3 <skill-dir>/scripts/relocate.py verify "<old>" "<new>" --token "<apply-token>"
-```
-
-Use `--without-link` only for the explicitly linkless branch. Confirm all of the following:
-
-- filesystem state is complete;
-- the token verifies the destination identity when available;
-- structured metadata has zero remaining changes;
-- SQLite `quick_check` is `ok`;
-- Codex shows the new project and all expected tasks.
-
-Disk verification cannot prove that the UI reloaded. Complete the relocation only after the user confirms the final Codex view.
-
-## Status handling
-
-- Exit `0`: the command produced a normal result; always inspect JSON `status`. `ready` and `repair-ready` require a later approved mutation, while `blocked` must stop even though the read-only command exited `0`. Only `completed`, `clean`, `already-complete`, or `verified` represent their corresponding completed operation.
-- Exit `2`: unsafe or stale; no project or Codex metadata mutation should have started.
-- Exit `3`: recoverable partial state; read `references/recovery.md` before retrying.
-- Exit `4`: verification failed; inspect the reported filesystem and metadata sections.
+Deliver the old/new paths, same-project association result, filesystem/catalog status, tested task IDs and access results, remaining compatibility dependencies, and plan/receipt locations. State any outstanding runtime check explicitly; do not claim complete migration from an exit code alone.

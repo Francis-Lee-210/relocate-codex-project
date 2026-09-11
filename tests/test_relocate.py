@@ -1,9 +1,9 @@
+"""V2 relocation acceptance tests against isolated, modern Codex fixtures."""
 from __future__ import annotations
 
-import contextlib
+from contextlib import closing
+import copy
 import hashlib
-import importlib.util
-import io
 import json
 import os
 from pathlib import Path
@@ -13,1433 +13,545 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
-from types import SimpleNamespace
 
 
-REPO = Path(__file__).resolve().parents[1]
-SCRIPT = REPO / "relocate-codex-project" / "scripts" / "relocate.py"
-
-
-def digest(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+SCRIPTS = Path(__file__).resolve().parents[1] / "relocate-codex-project" / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+import _catalog as catalog
+import _filesystem as filesystem
+import relocate
 
 
 class RelocateFixture(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory(dir="/private/tmp")
-        self.root = Path(self.temporary.name)
-        self.old = self.root / "旧 Project"
-        self.new = self.root / "New Project"
-        self.old.mkdir()
-        (self.old / "payload.txt").write_text("unchanged\n", encoding="utf-8")
-
+        self.temporary = tempfile.TemporaryDirectory(prefix="codex-relocate-v2-", dir="/private/tmp")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.old = self.root / "from" / "旧 Project"
+        self.new = self.root / "to" / "New Project"
+        self.old.mkdir(parents=True)
+        self.new.parent.mkdir()
+        (self.old / "src").mkdir()
+        (self.old / "alternate").mkdir()
+        (self.old / "payload.txt").write_bytes(b"keep project contents\n")
+        self.shared = self.root / "shared-root"
+        self.unrelated = self.root / "unrelated-root"
+        self.shared.mkdir()
+        self.unrelated.mkdir()
         self.codex_home = self.root / "codex-home"
         self.codex_home.mkdir()
         self.state_db = self.codex_home / "state_5.sqlite"
-        self.session = (
-            self.codex_home
-            / "sessions"
-            / "2026"
-            / "07"
-            / "14"
-            / "rollout-test.jsonl"
-        )
-        self.session.parent.mkdir(parents=True)
         self.global_state = self.codex_home / ".codex-global-state.json"
-        self._create_metadata(migration=40)
+        self.records = self.root / "records"
+        self.records.mkdir()
+        self.plan_path = self.records / "move.json"
+        self.receipt = self.records / "move.receipt.json"
+        self.desktop_id = "desktop-project-1"
+        self.native_id = "native-project-1"
+        self.sessions: dict[str, Path] = {}
+        with closing(sqlite3.connect(self.state_db)) as db, db:
+            db.executescript("""
+                CREATE TABLE _sqlx_migrations(version INTEGER PRIMARY KEY, success INTEGER NOT NULL);
+                INSERT INTO _sqlx_migrations VALUES(52, 1);
+                CREATE TABLE projects(id TEXT PRIMARY KEY, name TEXT NOT NULL);
+                CREATE TABLE project_roots(project_id TEXT, position INTEGER, path TEXT);
+                CREATE TABLE threads(
+                    id TEXT PRIMARY KEY, cwd TEXT NOT NULL, rollout_path TEXT NOT NULL,
+                    sandbox_policy TEXT NOT NULL, project_id TEXT, archived INTEGER NOT NULL,
+                    name TEXT
+                );
+            """)
+            db.executemany("INSERT INTO projects VALUES(?,?)", [
+                (self.native_id, "Project"), ("native-other", "Other")])
+            db.executemany("INSERT INTO project_roots VALUES(?,?,?)", [
+                (self.native_id, 0, str(self.old)), (self.native_id, 1, str(self.shared)),
+                ("native-other", 0, str(self.unrelated))])
+        self.desktop = {
+            "local-projects": {
+                self.desktop_id: {"name": "Project", "rootPaths": [str(self.old), str(self.shared)]},
+                "desktop-other": {"name": "Other", "rootPaths": [str(self.unrelated)]},
+            },
+            "app-server-project-id-by-legacy-project-id-by-host": {
+                f"local:{self.codex_home}": {self.desktop_id: self.native_id, "desktop-other": "native-other"}
+            },
+            "thread-project-assignments": {},
+            "thread-writable-roots": {"active": [str(self.old), str(self.shared)]},
+            "thread-workspace-root-hints": {"active": str(self.old / "src")},
+            "electron-persisted-atom-state": {"heartbeat-thread-permissions-by-id": {
+                "active": {"sandboxPolicy": {"writableRoots": [str(self.old), str(self.shared)]}}
+            }},
+            "unrelated-ui-setting": {"keep": "original"},
+        }
+        self.add_thread("active", cwd=self.old / "src")
+        self.add_thread("archived", cwd=self.old, archived=True)
+        self.add_thread("unrelated", cwd=self.unrelated, affected=False)
+        self.save_desktop()
 
-    def tearDown(self) -> None:
-        self.temporary.cleanup()
-
-    def _create_metadata(self, *, migration: int) -> None:
-        connection = sqlite3.connect(self.state_db)
-        connection.executescript(
-            """
-            CREATE TABLE _sqlx_migrations (
-                version INTEGER PRIMARY KEY,
-                description TEXT NOT NULL,
-                installed_on TEXT,
-                success INTEGER NOT NULL,
-                checksum BLOB,
-                execution_time INTEGER
-            );
-            CREATE TABLE threads (
-                id TEXT PRIMARY KEY,
-                cwd TEXT NOT NULL,
-                rollout_path TEXT NOT NULL,
-                sandbox_policy TEXT NOT NULL
-            );
-            """
-        )
-        connection.execute(
-            "INSERT INTO _sqlx_migrations(version, description, success) VALUES (?, 'fixture', 1)",
-            (migration,),
-        )
-        policy = {
+    def policy(self, root: Path | None = None) -> dict:
+        root = root or self.old
+        return {
             "type": "managed",
-            "file_system": {
-                "type": "restricted",
-                "entries": [
-                    {
-                        "path": {"type": "path", "path": str(self.old)},
-                        "access": "write",
-                    },
-                    {
-                        "path": {"type": "path", "path": str(self.old / ".git")},
-                        "access": "read",
-                    },
-                    {
-                        "path": {"type": "path", "path": str(self.root / "unrelated")},
-                        "access": "read",
-                    },
-                ],
-            },
-            "network": "restricted",
+            "file_system": {"type": "restricted", "entries": [
+                {"access": "read", "path": {"type": "special", "value": "root"}},
+                {"access": "write", "path": {"type": "path", "path": str(root)}},
+                *[{"access": "read", "path": {"type": "path", "path": str(root / leaf)}}
+                  for leaf in (".git", ".agents", ".codex")],
+                {"access": "write", "path": {"type": "path", "path": str(self.shared)}},
+            ]},
+            "network": {"mode": "restricted"},
         }
-        connection.execute(
-            "INSERT INTO threads(id, cwd, rollout_path, sandbox_policy) VALUES (?, ?, ?, ?)",
-            ("thread-1", str(self.old), str(self.session), json.dumps(policy, ensure_ascii=False)),
-        )
-        connection.commit()
-        connection.close()
 
-        meta = {
-            "timestamp": "2026-07-14T00:00:00Z",
-            "type": "session_meta",
-            "payload": {
-                "id": "thread-1",
-                "cwd": str(self.old),
-                "source": "fixture",
-            },
-        }
-        history = {
-            "type": "response_item",
-            "payload": {
-                "type": "message",
-                "content": f"Historical prose keeps {self.old} unchanged",
-            },
-        }
-        self.history_line = json.dumps(history, ensure_ascii=False, separators=(",", ":")) + "\n"
-        self.session.write_text(
-            json.dumps(meta, ensure_ascii=False, separators=(",", ":"))
-            + "\n"
-            + self.history_line,
-            encoding="utf-8",
-        )
+    def add_thread(self, identifier: str, *, cwd: Path, archived=False, affected=True) -> None:
+        session = self.codex_home / ("archived_sessions" if archived else "sessions") / "2026" / f"{identifier}.jsonl"
+        session.parent.mkdir(parents=True, exist_ok=True)
+        head = {"type": "session_meta", "payload": {"id": identifier, "cwd": str(cwd)}}
+        history = (json.dumps(head) + "\n").encode() + (
+            '{"type":"turn_context","payload":{"cwd":' + json.dumps(str(cwd)) + '}}\n'
+            '{"type":"response_item","payload":{"content":"historical bytes stay unchanged"}}\n'
+        ).encode()
+        session.write_bytes(history)
+        self.sessions[identifier] = session
+        with closing(sqlite3.connect(self.state_db)) as db, db:
+            db.execute("INSERT INTO threads VALUES(?,?,?,?,?,?,?)", (
+                identifier, str(cwd), str(session), json.dumps(self.policy(self.old if affected else self.unrelated)),
+                self.native_id if affected else "native-other", int(archived), identifier))
+        self.desktop["thread-project-assignments"][identifier] = {
+            "projectKind": "local", "projectId": self.desktop_id if affected else "desktop-other"}
+        self.save_desktop()
 
-        state = {
-            "electron-saved-workspace-roots": [str(self.old)],
-            "active-workspace-roots": [str(self.old)],
-            "thread-writable-roots": {
-                "thread-1": [str(self.old), str(self.root / "extra")]
-            },
-            "prompt-history": {
-                "thread-1": [f"Historical prose keeps {self.old} unchanged"]
-            },
-        }
-        self.global_state.write_text(
-            json.dumps(state, ensure_ascii=False, separators=(",", ":")),
-            encoding="utf-8",
-        )
+    def save_desktop(self) -> None:
+        self.global_state.write_text(json.dumps(self.desktop), encoding="utf-8")
 
-    def make_metadata_clean_for_destination(self) -> None:
+    def query(self, sql: str, values=()) -> list:
+        with closing(sqlite3.connect(self.state_db)) as db, db:
+            return db.execute(sql, values).fetchall()
+
+    def sql(self, sql: str, values=()) -> None:
+        with closing(sqlite3.connect(self.state_db)) as db, db:
+            db.execute(sql, values)
+
+    def store_snapshot(self) -> dict:
+        result = {}
+        for path in self.codex_home.rglob("*"):
+            if path.is_file():
+                info = path.stat()
+                result[str(path.relative_to(self.codex_home))] = (
+                    info.st_ino, info.st_size, info.st_mtime_ns, hashlib.sha256(path.read_bytes()).hexdigest())
+        return result
+
+    def save_plan(self) -> dict:
+        plan = relocate.make_plan(self.old, self.new, self.codex_home)
+        self.assertEqual(plan["status"], "ready", plan.get("blockers"))
+        self.plan_path.write_bytes(catalog.canonical_json(plan) + b"\n")
+        return plan
+
+    def apply_quiet(self, *, recovering=False) -> dict:
+        with mock.patch.object(relocate, "require_quiet_tree"):
+            return relocate.apply_plan(self.plan_path, recovering=recovering)
+
+    def moved_plan(self) -> dict:
+        plan = self.save_plan()
+        self.apply_quiet()
+        return plan
+
+    def native_edit_projects(self, *, desktop=True, native=True) -> None:
+        """Simulate the app's writes to this fixture; production never performs them."""
+        self.desktop["local-projects"][self.desktop_id]["rootPaths"] = [
+            str(self.new if desktop else self.old), str(self.shared)]
+        self.save_desktop()
+        self.sql("UPDATE project_roots SET path=? WHERE project_id=? AND position=0",
+                 (str(self.new if native else self.old), self.native_id))
+
+    def native_edit_thread_settings(self) -> None:
+        for identifier, cwd in (("active", self.new / "src"), ("archived", self.new)):
+            self.sql("UPDATE threads SET cwd=?, sandbox_policy=? WHERE id=?",
+                     (str(cwd), json.dumps(self.policy(self.new)), identifier))
+        self.desktop["thread-writable-roots"]["active"] = [str(self.new), str(self.shared)]
+        self.desktop["thread-workspace-root-hints"]["active"] = str(self.new / "src")
+        self.desktop["electron-persisted-atom-state"]["heartbeat-thread-permissions-by-id"]["active"]["sandboxPolicy"]["writableRoots"] = [str(self.new), str(self.shared)]
+        self.save_desktop()
+
+    def run_cli(self, *arguments: str) -> tuple[int, dict]:
+        env = {**os.environ, "CODEX_HOME": str(self.codex_home), "PYTHONDONTWRITEBYTECODE": "1"}
+        result = subprocess.run([sys.executable, str(SCRIPTS / "relocate.py"), *arguments],
+                                cwd=self.records, env=env, text=True, capture_output=True, timeout=40)
+        self.assertNotIn("Traceback", result.stderr, result.stderr)
+        self.assertTrue(result.stdout.strip(), result.stderr)
+        return result.returncode, json.loads(result.stdout)
+
+
+class CatalogAndFlowTests(RelocateFixture):
+    def test_read_only_plan_inventories_modern_ids_archives_and_permissions(self) -> None:
+        before = self.store_snapshot()
+        plan = self.save_plan()
+        self.assertEqual(self.store_snapshot(), before)
+        self.assertEqual(plan["catalog"]["schema_migration"], 52)
+        self.assertEqual(plan["native_steps"], [{"project_id": self.desktop_id, "native_id": self.native_id,
+            "before_roots": [str(self.old), str(self.shared)],
+            "after_roots": [str(self.new), str(self.shared)]}])
+        self.assertEqual({t["id"] for t in plan["catalog"]["threads"]}, {"active", "archived"})
+        self.assertTrue(next(t for t in plan["catalog"]["threads"] if t["id"] == "archived")["archived"])
+        self.assertEqual(plan["catalog"]["threads"][0]["policy"], self.policy())
+        self.assertFalse(self.new.exists())
+
+    def test_wal_snapshot_reads_committed_changes_without_touching_live_sidecars(self) -> None:
         connection = sqlite3.connect(self.state_db)
-        policy_text = connection.execute(
-            "SELECT sandbox_policy FROM threads WHERE id = 'thread-1'"
-        ).fetchone()[0]
-        policy = json.loads(policy_text)
-        for entry in policy["file_system"]["entries"]:
-            value = entry["path"].get("path")
-            if isinstance(value, str) and value.startswith(str(self.old)):
-                entry["path"]["path"] = str(self.new) + value[len(str(self.old)) :]
-        connection.execute(
-            "UPDATE threads SET cwd = ?, sandbox_policy = ? WHERE id = 'thread-1'",
-            (
-                str(self.new),
-                json.dumps(policy, ensure_ascii=False, separators=(",", ":")),
-            ),
-        )
+        self.addCleanup(connection.close)
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA wal_autocheckpoint=0")
+        policy = self.policy()
+        policy["wal_only_marker"] = "committed in WAL"
+        connection.execute("UPDATE threads SET sandbox_policy=? WHERE id='active'", (json.dumps(policy),))
         connection.commit()
-        connection.close()
+        self.assertGreater(Path(str(self.state_db) + "-wal").stat().st_size, 0)
+        before = self.store_snapshot()
 
-        lines = self.session.read_text(encoding="utf-8").splitlines(keepends=True)
-        meta = json.loads(lines[0])
-        meta["payload"]["cwd"] = str(self.new)
-        self.session.write_text(
-            json.dumps(meta, ensure_ascii=False, separators=(",", ":"))
-            + "\n"
-            + "".join(lines[1:]),
-            encoding="utf-8",
-        )
-        state = json.loads(self.global_state.read_text(encoding="utf-8"))
-        state["electron-saved-workspace-roots"] = [str(self.new)]
-        state["active-workspace-roots"] = [str(self.new)]
-        state["thread-writable-roots"]["thread-1"][0] = str(self.new)
-        self.global_state.write_text(
-            json.dumps(state, ensure_ascii=False, separators=(",", ":")),
-            encoding="utf-8",
-        )
+        plan = self.save_plan()
 
-    def run_script(self, *arguments: str) -> tuple[subprocess.CompletedProcess[str], dict]:
-        command = [
-            sys.executable,
-            str(SCRIPT),
-            *arguments,
-            "--codex-home",
-            str(self.codex_home),
-        ]
-        result = subprocess.run(command, text=True, capture_output=True, check=False)
-        try:
-            payload = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
-            self.fail(f"Invalid JSON output.\nstdout={result.stdout}\nstderr={result.stderr}\n{exc}")
-        return result, payload
+        active = next(t for t in plan["catalog"]["threads"] if t["id"] == "active")
+        self.assertEqual(active["policy"]["wal_only_marker"], "committed in WAL")
+        self.assertEqual(self.store_snapshot(), before)
 
-    def plan(self) -> tuple[subprocess.CompletedProcess[str], dict]:
-        return self.run_script("plan", str(self.old), str(self.new))
+    def test_cli_plan_apply_recover_and_verify_preserve_all_codex_stores(self) -> None:
+        before = self.store_snapshot()
+        project_inode = self.old.stat().st_ino
+        code, plan = self.run_cli("plan", str(self.old), str(self.new), "--codex-home", str(self.codex_home))
+        self.assertEqual(code, 0, plan)
+        self.plan_path.write_bytes(catalog.canonical_json(plan) + b"\n")
+        code, applied = self.run_cli("apply", "--plan", str(self.plan_path))
+        self.assertEqual(code, 0, applied)
+        self.assertEqual(applied["status"], "filesystem-moved-native-update-pending")
+        self.assertEqual(self.new.stat().st_ino, project_inode)
+        self.assertEqual((self.new / "payload.txt").read_bytes(), b"keep project contents\n")
+        self.assertTrue(self.old.is_symlink())
+        self.assertEqual(self.store_snapshot(), before)
+        code, pending = self.run_cli("verify", "--plan", str(self.plan_path))
+        self.assertEqual(code, 4, pending)
+        self.assertEqual(pending["status"], "verification-pending")
+        code, recovered = self.run_cli("recover", "--plan", str(self.plan_path))
+        self.assertEqual(code, 0, recovered)
+        self.assertEqual(recovered["filesystem"]["status"], "already-complete")
+        self.assertEqual(self.store_snapshot(), before)
+        self.native_edit_projects()
+        metadata_after_app = self.store_snapshot()
+        code, verified = self.run_cli("verify", "--plan", str(self.plan_path))
+        self.assertEqual(code, 0, verified)
+        self.assertEqual(verified["status"], "ready-for-runtime-check")
+        self.assertEqual({p["id"] for p in verified["audit"]["projects"]}, {self.desktop_id})
+        self.assertEqual({t["id"] for t in verified["audit"]["threads"]}, {"active", "archived"})
+        self.assertEqual({t["state"] for t in verified["audit"]["threads"]}, {"compatibility-dependent"})
+        self.assertTrue(verified["keep_compatibility_link"])
+        self.assertEqual(self.store_snapshot(), metadata_after_app)
+
+    def test_one_sided_project_updates_remain_pending(self) -> None:
+        plan = self.moved_plan()
+        for desktop, native in ((True, False), (False, True)):
+            with self.subTest(desktop=desktop, native=native):
+                self.native_edit_projects(desktop=desktop, native=native)
+                audit = relocate.inspect_plan(plan)
+                self.assertEqual(audit["status"], "verification-pending")
+                self.assertTrue(audit["audit"]["pending"])
+                self.assertFalse(audit["audit"]["conflicts"])
+
+    def test_direct_settings_preserve_history_but_do_not_certify_runtime(self) -> None:
+        plan = self.moved_plan()
+        histories = {key: path.read_bytes() for key, path in self.sessions.items()}
+        self.native_edit_projects()
+        self.native_edit_thread_settings()
+        result = relocate.inspect_plan(plan)
+        self.assertEqual(result["status"], "ready-for-runtime-check")
+        self.assertEqual({t["state"] for t in result["audit"]["threads"]}, {"direct-settings"})
+        self.assertEqual({t["runtime_check"] for t in result["audit"]["threads"]}, {"not-performed-by-helper"})
+        self.assertEqual(result["audit"]["compatibility_dependencies"], [])
+        self.assertTrue(result["keep_compatibility_link"])
+        self.assertEqual({key: path.read_bytes() for key, path in self.sessions.items()}, histories)
+
+    def test_permission_broadening_carveout_loss_and_root_loss_are_conflicts(self) -> None:
+        plan = self.moved_plan()
+        self.native_edit_projects()
+        self.native_edit_thread_settings()
+        for change in ("broaden", "remove-carveout", "remove-shared-root"):
+            with self.subTest(change=change):
+                policy = self.policy(self.new)
+                entries = policy["file_system"]["entries"]
+                if change == "broaden":
+                    entries[2]["access"] = "write"
+                elif change == "remove-carveout":
+                    entries.pop(2)
+                else:
+                    entries.pop()
+                self.sql("UPDATE threads SET sandbox_policy=? WHERE id='active'", (json.dumps(policy),))
+                audit = relocate.inspect_plan(plan)
+                self.assertEqual(audit["status"], "verification-pending")
+                self.assertTrue(any("permissions" in c for c in audit["audit"]["conflicts"]))
+
+    def test_project_root_order_loss_and_identity_changes_are_conflicts(self) -> None:
+        plan = self.moved_plan()
+        self.native_edit_projects()
+        for roots in ([str(self.new)], [str(self.shared), str(self.new)]):
+            with self.subTest(roots=roots):
+                self.desktop["local-projects"][self.desktop_id]["rootPaths"] = roots
+                self.save_desktop()
+                self.assertTrue(relocate.inspect_plan(plan)["audit"]["conflicts"])
+        self.native_edit_projects()
+        mapping = self.desktop["app-server-project-id-by-legacy-project-id-by-host"][f"local:{self.codex_home}"]
+        mapping[self.desktop_id] = "native-other"
+        self.save_desktop()
+        self.assertTrue(relocate.inspect_plan(plan)["audit"]["conflicts"])
+
+    def test_missing_or_new_affected_tasks_are_conflicts(self) -> None:
+        plan = self.moved_plan()
+        self.native_edit_projects()
+        self.add_thread("new-affected", cwd=self.new / "src")
+        audit = relocate.inspect_plan(plan)
+        self.assertTrue(any("New affected task" in c for c in audit["audit"]["conflicts"]))
+        self.sql("DELETE FROM threads WHERE id='new-affected'")
+        self.sql("DELETE FROM threads WHERE id='archived'")
+        audit = relocate.inspect_plan(plan)
+        self.assertTrue(any("archived" in c and "missing" in c for c in audit["audit"]["conflicts"]))
+
+    def test_affected_changes_stale_plan_but_unrelated_changes_do_not(self) -> None:
+        self.save_plan()
+        self.sql("UPDATE threads SET cwd=? WHERE id='active'", (str(self.old / "alternate"),))
+        before = self.store_snapshot()
+        with self.assertRaises(filesystem.Refusal):
+            self.apply_quiet()
+        self.assertTrue(self.old.is_dir())
+        self.assertFalse(self.new.exists())
+        self.assertEqual(self.store_snapshot(), before)
+        self.sql("UPDATE threads SET cwd=? WHERE id='active'", (str(self.old / "src"),))
+        self.add_thread("new-unrelated", cwd=self.unrelated, affected=False)
+        self.desktop["unrelated-ui-setting"] = {"keep": "changed independently"}
+        self.save_desktop()
+        before = self.store_snapshot()
+        self.assertEqual(self.apply_quiet()["status"], "filesystem-moved-native-update-pending")
+        self.assertEqual(self.store_snapshot(), before)
+
+    def test_metadata_change_during_writer_scan_refuses_before_rename(self) -> None:
+        self.save_plan()
+
+        def concurrent_change(_root):
+            self.sql("UPDATE threads SET cwd=? WHERE id='active'", (str(self.old / "alternate"),))
+
+        with mock.patch.object(relocate, "require_quiet_tree", side_effect=concurrent_change):
+            with self.assertRaises((filesystem.Refusal, filesystem.PartialFailure)):
+                relocate.apply_plan(self.plan_path)
+        self.assertTrue(self.old.is_dir())
+        self.assertFalse(self.old.is_symlink())
+        self.assertFalse(self.new.exists())
+
+    def test_absolute_and_chained_parent_traversal_links_block_before_rename(self) -> None:
+        (self.old.parent / "shared").mkdir()
+        for target in (str(self.old) + "/../shared", "alias/../shared"):
+            with self.subTest(target=target):
+                if target.startswith("alias/"):
+                    (self.old / "alias").symlink_to(self.old, target_is_directory=True)
+                (self.old / "risky-link").symlink_to(target, target_is_directory=True)
+                plan = relocate.make_plan(self.old, self.new, self.codex_home)
+                self.assertEqual(plan["status"], "blocked")
+                self.assertTrue(any(r["kind"] != "absolute-link-needs-compatibility" for r in plan["tree_risks"]))
+                self.assertFalse(self.new.exists())
+                (self.old / "risky-link").unlink()
+
+    def test_external_alias_into_old_tree_remains_compatibility_dependency(self) -> None:
+        alias = self.root / "external-alias"
+        alias.symlink_to(self.old, target_is_directory=True)
+        (self.old / "indirect-absolute-link").symlink_to(alias / "payload.txt")
+        plan = self.moved_plan()
+        self.native_edit_projects()
+        self.native_edit_thread_settings()
+
+        audit = relocate.inspect_plan(plan)
+
+        self.assertEqual(audit["status"], "ready-for-runtime-check")
+        self.assertTrue(any(item["owner"] == "project symlink"
+                            for item in audit["audit"]["compatibility_dependencies"]))
+        self.assertEqual((self.new / "indirect-absolute-link").read_bytes(), b"keep project contents\n")
 
 
-class ReadOnlyAndSafetyTests(RelocateFixture):
-    def test_plan_is_read_only_and_reports_structured_changes(self) -> None:
-        before = {
-            "db": digest(self.state_db),
-            "session": digest(self.session),
-            "global": digest(self.global_state),
-            "payload": digest(self.old / "payload.txt"),
-        }
-        result, payload = self.plan()
-        self.assertEqual(
-            result.returncode,
-            0,
-            json.dumps(payload, ensure_ascii=False, sort_keys=True),
-        )
-        self.assertEqual(payload["status"], "ready")
-        self.assertIsNotNone(payload["apply_token"])
-        self.assertGreaterEqual(payload["metadata"]["change_count"], 7)
-        self.assertEqual(before["db"], digest(self.state_db))
-        self.assertEqual(before["session"], digest(self.session))
-        self.assertEqual(before["global"], digest(self.global_state))
-        self.assertEqual(before["payload"], digest(self.old / "payload.txt"))
-        self.assertFalse((self.codex_home / "relocation-backups").exists())
+class InvalidInputTests(RelocateFixture):
+    def test_missing_native_mapping_and_collapsing_roots_block_planning(self) -> None:
+        host_map = self.desktop["app-server-project-id-by-legacy-project-id-by-host"][f"local:{self.codex_home}"]
+        del host_map[self.desktop_id]
+        self.save_desktop()
+        self.assertEqual(relocate.make_plan(self.old, self.new, self.codex_home)["status"], "blocked")
+        host_map[self.desktop_id] = self.native_id
+        self.desktop["local-projects"][self.desktop_id]["rootPaths"] = [str(self.old), str(self.new)]
+        self.save_desktop()
+        self.sql("UPDATE project_roots SET path=? WHERE project_id=? AND position=1", (str(self.new), self.native_id))
+        plan = relocate.make_plan(self.old, self.new, self.codex_home)
+        self.assertEqual(plan["status"], "blocked")
+        self.assertTrue(any("collapse" in b for b in plan["blockers"]))
 
-    def test_existing_destination_is_refused_without_changes(self) -> None:
+    def test_tampered_malformed_or_structurally_invalid_plans_fail_closed(self) -> None:
+        plan = self.save_plan()
+        tampered = copy.deepcopy(plan)
+        tampered["new"] = str(self.root / "unapproved-destination")
+        invalid_structure = copy.deepcopy(plan)
+        invalid_structure["catalog"] = ["invalid-container"]
+        invalid_structure.pop("plan_id")
+        invalid_structure["plan_id"] = relocate.digest(invalid_structure)
+        for raw in (b"{not-json", b"[]", catalog.canonical_json(tampered), catalog.canonical_json(invalid_structure)):
+            with self.subTest(raw=raw[:45]):
+                self.plan_path.write_bytes(raw)
+                before = self.store_snapshot()
+                code, result = self.run_cli("apply", "--plan", str(self.plan_path))
+                self.assertEqual(code, 2, result)
+                self.assertEqual(self.store_snapshot(), before)
+                self.assertTrue(self.old.is_dir())
+                self.assertFalse(self.new.exists())
+
+    def test_symlinked_or_in_project_plan_is_refused(self) -> None:
+        plan = self.save_plan()
+        linked = self.records / "linked-plan.json"
+        linked.symlink_to(self.plan_path)
+        with self.assertRaises(filesystem.Refusal):
+            relocate.load_plan(linked)
+        inside = self.old / "plan.json"
+        inside.write_bytes(catalog.canonical_json(plan))
+        with self.assertRaises(filesystem.Refusal):
+            relocate.load_plan(inside)
+        self.assertFalse(self.new.exists())
+
+    def test_missing_mismatched_external_and_symlinked_histories_are_refused(self) -> None:
+        original = self.sessions["active"]
+        original_bytes = original.read_bytes()
+        outside = self.root / "external-history.jsonl"
+        outside.write_bytes(original_bytes)
+        for kind in ("missing", "wrong-id", "external", "symlink"):
+            with self.subTest(kind=kind):
+                if original.is_symlink():
+                    original.unlink()
+                original.write_bytes(original_bytes)
+                self.sql("UPDATE threads SET rollout_path=? WHERE id='active'", (str(original),))
+                if kind == "missing":
+                    original.unlink()
+                elif kind == "wrong-id":
+                    original.write_text('{"type":"session_meta","payload":{"id":"other"}}\n')
+                elif kind == "external":
+                    self.sql("UPDATE threads SET rollout_path=? WHERE id='active'", (str(outside),))
+                else:
+                    original.unlink()
+                    original.symlink_to(outside)
+                with self.assertRaises(filesystem.Refusal):
+                    relocate.make_plan(self.old, self.new, self.codex_home)
+                self.assertTrue(self.old.is_dir())
+                self.assertFalse(self.new.exists())
+
+    def test_malformed_history_and_permission_shapes_return_structured_refusals(self) -> None:
+        original = self.sessions["active"].read_bytes()
+        for header in (b"[]\n", b'{"type":"session_meta","payload":[]}\n', b'{"type":"session_meta","payload":{"id":"active","id":"other"}}\n'):
+            with self.subTest(header=header):
+                self.sessions["active"].write_bytes(header)
+                code, result = self.run_cli("plan", str(self.old), str(self.new), "--codex-home", str(self.codex_home))
+                self.assertEqual(code, 2, result)
+                self.assertFalse(self.new.exists())
+        self.sessions["active"].write_bytes(original)
+        for policy in ({"file_system": {"entries": ["invalid"]}}, {"file_system": {"entries": None}}):
+            with self.subTest(policy=policy):
+                self.sql("UPDATE threads SET sandbox_policy=? WHERE id='active'", (json.dumps(policy),))
+                code, result = self.run_cli("plan", str(self.old), str(self.new), "--codex-home", str(self.codex_home))
+                self.assertEqual(code, 2, result)
+                self.assertFalse(self.new.exists())
+
+    def test_unreadable_or_untrusted_catalog_is_never_repaired_by_helper(self) -> None:
+        before = self.store_snapshot()
+        self.global_state.write_text('{"local-projects":{},"local-projects":{}}')
+        with self.assertRaises(filesystem.Refusal):
+            relocate.make_plan(self.old, self.new, self.codex_home)
+        self.save_desktop()
+        external = self.root / "external-db.sqlite"
+        self.state_db.rename(external)
+        self.state_db.symlink_to(external)
+        with self.assertRaises(filesystem.Refusal):
+            relocate.make_plan(self.old, self.new, self.codex_home)
+        self.assertEqual(hashlib.sha256(external.read_bytes()).hexdigest(), before["state_5.sqlite"][3])
+        self.assertTrue(self.old.is_dir())
+        self.assertFalse(self.new.exists())
+
+
+class WriterAndRecoveryTests(RelocateFixture):
+    def test_plan_durability_failure_stops_before_move(self) -> None:
+        self.save_plan()
+        before = self.store_snapshot()
+        with mock.patch.object(relocate.os, "fsync", side_effect=OSError("plan sync failed")):
+            with self.assertRaises(OSError):
+                self.apply_quiet()
+        self.assertTrue(self.old.is_dir())
+        self.assertFalse(self.new.exists())
+        self.assertFalse(self.receipt.exists())
+        self.assertEqual(self.store_snapshot(), before)
+
+    def test_plan_replacement_during_preparation_stops_before_move(self) -> None:
+        self.save_plan()
+
+        def replace_plan(_root):
+            self.plan_path.write_text('{}')
+
+        with mock.patch.object(relocate, "require_quiet_tree", side_effect=replace_plan):
+            with self.assertRaises(filesystem.Refusal):
+                relocate.apply_plan(self.plan_path)
+        self.assertTrue(self.old.is_dir())
+        self.assertFalse(self.new.exists())
+
+    def test_writer_parser_includes_cwd_and_writable_handles_only(self) -> None:
+        other_pid = os.getpid() + 10000
+        output = (f"p{other_pid}\nceditor\nfcwd\nn{self.old}\nf8\naw\nn{self.old}/write file\n"
+                  f"f9\nar\nn{self.old}/read file\nf10\nau\nn{self.old}/read-write\n"
+                  f"p{os.getpid()}\ncself\nfcwd\nn{self.old}\nf7\naw\nn{self.old}/self-write\n")
+        writers = relocate.parse_writers(output)
+        self.assertEqual([(entry["pid"], entry["fd"]) for entry in writers],
+                         [(other_pid, "cwd"), (other_pid, "8"), (other_pid, "10")])
+        self.assertEqual(writers[1]["path"], str(self.old) + "/write file")
+
+    def test_writer_scan_missing_tool_incomplete_scan_and_active_writer_refuse(self) -> None:
+        for outcome in (FileNotFoundError("lsof missing"),
+                        subprocess.CompletedProcess([], 1, "", "warning: incomplete"),
+                        subprocess.CompletedProcess([], 0, f"p{os.getpid()+10000}\nceditor\nf4\naw\nn{self.old}/payload.txt\n", "")):
+            with self.subTest(outcome=type(outcome).__name__):
+                kwargs = {"side_effect": outcome} if isinstance(outcome, Exception) else {"return_value": outcome}
+                with mock.patch.object(relocate.subprocess, "run", **kwargs):
+                    with self.assertRaises(filesystem.Refusal):
+                        relocate.require_quiet_tree(self.old)
+        with mock.patch.object(relocate.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")):
+            relocate.require_quiet_tree(self.old)
+        with mock.patch.object(relocate.Path, "cwd", return_value=self.old / "src"):
+            with self.assertRaises(filesystem.Refusal):
+                relocate.require_quiet_tree(self.old)
+
+    def test_interruption_after_rename_recovers_original_directory_and_preserves_metadata(self) -> None:
+        plan = self.save_plan()
+        before = self.store_snapshot()
+        real_link = filesystem.create_compatibility_link
+        with mock.patch.object(filesystem, "create_compatibility_link", side_effect=OSError("interrupted before link")):
+            with self.assertRaises(filesystem.PartialFailure):
+                self.apply_quiet()
+        self.assertEqual(filesystem.path_kind(self.old), "absent")
+        self.assertTrue(filesystem.same_object_identity(self.new, plan["filesystem"]["source_identity"]))
+        self.assertEqual(json.loads(self.receipt.read_text())["state"], "prepared")
+        self.assertEqual(self.store_snapshot(), before)
+        self.assertEqual(filesystem.create_compatibility_link, real_link)
+        self.assertEqual(self.apply_quiet(recovering=True)["filesystem"]["status"], "resumed")
+        self.assertTrue(self.old.is_symlink())
+        self.assertEqual(self.store_snapshot(), before)
+        self.assertEqual(self.apply_quiet(recovering=True)["filesystem"]["status"], "already-complete")
+
+    def test_recovery_wont_adopt_replacement_or_conflicting_receipt(self) -> None:
+        plan = self.save_plan()
+        self.receipt.write_text(json.dumps({"plan_id": "another-plan"}))
+        with self.assertRaises(filesystem.Refusal):
+            self.apply_quiet()
+        self.assertTrue(self.old.is_dir())
+        self.assertFalse(self.new.exists())
+        self.receipt.unlink()
+        self.old.rename(self.new)
+        parked = self.new.with_name("original-directory")
+        self.new.rename(parked)
         self.new.mkdir()
-        result, payload = self.plan()
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(payload["status"], "unsafe-refused")
-        self.assertTrue(self.old.is_dir())
-        self.assertTrue(self.new.is_dir())
-
-    def test_nested_destination_is_refused(self) -> None:
-        nested = self.old / "nested"
-        result = subprocess.run(
-            [
-                sys.executable,
-                str(SCRIPT),
-                "plan",
-                str(self.old),
-                str(nested),
-                "--codex-home",
-                str(self.codex_home),
-            ],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        self.assertEqual(result.returncode, 2)
-        self.assertTrue(self.old.is_dir())
-
-    def test_stale_source_identity_is_refused(self) -> None:
-        _, planned = self.plan()
-        (self.old / "new-entry.txt").write_text("changes directory mtime", encoding="utf-8")
-        result, payload = self.run_script(
-            "apply",
-            str(self.old),
-            str(self.new),
-            "--token",
-            planned["apply_token"],
-        )
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(payload["status"], "unsafe-refused")
-        self.assertTrue(self.old.is_dir())
-        self.assertFalse(self.new.exists())
-
-    def test_case_only_destination_is_refused(self) -> None:
-        case_alias = self.root / "旧 project"
-        result = subprocess.run(
-            [
-                sys.executable,
-                str(SCRIPT),
-                "plan",
-                str(self.old),
-                str(case_alias),
-                "--codex-home",
-                str(self.codex_home),
-            ],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        self.assertEqual(result.returncode, 2)
-        self.assertTrue(self.old.is_dir())
-
-    def test_wrong_existing_symlink_is_refused(self) -> None:
-        other = self.root / "other"
-        other.mkdir()
-        os.rename(self.old, self.new)
-        os.symlink(str(other), str(self.old), target_is_directory=True)
-        result, payload = self.run_script("repair", str(self.old), str(self.new))
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("different target", payload["error"])
-
-    def test_reserved_characters_in_codex_home_uri(self) -> None:
-        special_home = self.root / "codex #home?"
-        os.rename(self.codex_home, special_home)
-        self.codex_home = special_home
-        self.state_db = special_home / "state_5.sqlite"
-        self.session = special_home / self.session.relative_to(self.root / "codex-home")
-        self.global_state = special_home / ".codex-global-state.json"
-        connection = sqlite3.connect(self.state_db)
-        connection.execute(
-            "UPDATE threads SET rollout_path = ? WHERE id = 'thread-1'",
-            (str(self.session),),
-        )
-        connection.commit()
-        connection.close()
-        result, payload = self.plan()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(payload["status"], "ready")
-
-    def test_malformed_global_state_blocks_plan(self) -> None:
-        encoded_old = json.dumps(str(self.old), ensure_ascii=False)
-        self.global_state.write_text(f'{{"broken":{encoded_old}\n', encoding="utf-8")
-
-        result, payload = self.plan()
-
-        self.assertEqual(result.returncode, 0)
-        self.assertEqual(payload["status"], "blocked")
-        self.assertIsNone(payload["apply_token"])
-        self.assertFalse(payload["metadata"]["audit_complete"])
-        self.assertFalse(payload["metadata"]["repair_supported"])
-
-    def test_malformed_session_containing_old_path_blocks_plan(self) -> None:
-        broken = self.session.with_name("rollout-broken.jsonl")
-        encoded_old = json.dumps(str(self.old), ensure_ascii=False)
-        broken.write_text(
-            f'{{"type":"session_meta","payload":{{"cwd":{encoded_old}\n',
-            encoding="utf-8",
-        )
-
-        result, payload = self.plan()
-
-        self.assertEqual(result.returncode, 0)
-        self.assertEqual(payload["status"], "blocked")
-        self.assertIsNone(payload["apply_token"])
-        self.assertFalse(payload["metadata"]["audit_complete"])
-
-    def test_malformed_session_without_old_path_is_only_a_warning(self) -> None:
-        broken = self.session.with_name("rollout-unrelated-broken.jsonl")
-        broken.write_text('{"unfinished":\n', encoding="utf-8")
-
-        result, payload = self.plan()
-
-        self.assertEqual(result.returncode, 0)
-        self.assertEqual(payload["status"], "ready")
-        self.assertTrue(payload["metadata"]["audit_complete"])
-        self.assertTrue(
-            any(str(broken) in warning for warning in payload["metadata"]["warnings"])
-        )
-
-    def test_explicit_state_database_outside_codex_home_is_refused(self) -> None:
-        outside = self.root / "external-state.sqlite"
-        outside.write_bytes(self.state_db.read_bytes())
-
-        result, payload = self.run_script(
-            "plan",
-            str(self.old),
-            str(self.new),
-            "--state-db",
-            str(outside),
-        )
-
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(payload["status"], "unsafe-refused")
-        self.assertIn("outside", payload["error"].lower())
-        self.assertTrue(self.old.is_dir())
-
-    def test_distinct_internal_explicit_state_database_is_refused(self) -> None:
-        alternate = self.codex_home / "other.sqlite"
-        alternate.write_bytes(self.state_db.read_bytes())
-
-        result, payload = self.run_script(
-            "plan",
-            str(self.old),
-            str(self.new),
-            "--state-db",
-            str(alternate),
-        )
-
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(payload["status"], "unsafe-refused")
-        self.assertIn("canonical active", payload["error"])
-        self.assertTrue(self.old.is_dir())
-        self.assertFalse(self.new.exists())
-
-    def test_symlink_state_database_is_refused(self) -> None:
-        real = self.codex_home / "real-state.sqlite"
-        self.state_db.rename(real)
-        self.state_db.symlink_to(real.name)
-
-        result, payload = self.plan()
-
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(payload["status"], "unsafe-refused")
-        self.assertIn("symlink", payload["error"].lower())
-        self.assertTrue(real.is_file())
-
-    def test_non_file_root_state_path_does_not_fall_back_to_legacy(self) -> None:
-        legacy = self.codex_home / "sqlite" / "state_5.sqlite"
-        legacy.parent.mkdir()
-        self.state_db.rename(legacy)
-        self.state_db.mkdir()
-
-        result, payload = self.plan()
-
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(payload["status"], "unsafe-refused")
-        self.assertIn("non-file node", payload["error"])
-        self.assertTrue(self.old.is_dir())
-        self.assertFalse(self.new.exists())
-
-    def test_rollback_journal_blocks_planning(self) -> None:
-        rollback_journal = Path(str(self.state_db) + "-journal")
-        rollback_journal.write_bytes(b"ambiguous rollback state")
-
-        result, payload = self.plan()
-
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(payload["status"], "unsafe-refused")
-        self.assertIn("rollback journal", payload["error"].lower())
-        self.assertTrue(self.old.is_dir())
-        self.assertFalse(self.new.exists())
-
-    def test_oversized_session_meta_blocks_planning(self) -> None:
-        self.session.write_bytes(b"{" + b" " * (8 * 1024 * 1024) + b"}")
-
-        result, payload = self.plan()
-
-        self.assertEqual(result.returncode, 0)
-        self.assertEqual(payload["status"], "blocked")
-        self.assertIsNone(payload["apply_token"])
-        self.assertIn("size limit", " ".join(payload["metadata"]["audit_errors"]))
-        self.assertTrue(self.old.is_dir())
-        self.assertFalse(self.new.exists())
-
-    def test_unallowlisted_sandbox_path_is_refused(self) -> None:
-        connection = sqlite3.connect(self.state_db)
-        policy_text = connection.execute(
-            "SELECT sandbox_policy FROM threads WHERE id = 'thread-1'"
-        ).fetchone()[0]
-        policy = json.loads(policy_text)
-        policy["network"] = {"unexpectedRoot": str(self.old)}
-        connection.execute(
-            "UPDATE threads SET sandbox_policy = ? WHERE id = 'thread-1'",
-            (json.dumps(policy, ensure_ascii=False, separators=(",", ":")),),
-        )
-        connection.commit()
-        connection.close()
-
-        result, payload = self.plan()
-
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(payload["status"], "unsafe-refused")
-        self.assertIn("outside the write allowlist", payload["error"])
-        self.assertIn(
-            "/network/unexpectedRoot",
-            json.dumps(payload["details"], ensure_ascii=False),
-        )
-
-    def test_malformed_policy_container_cannot_hide_an_old_path(self) -> None:
-        connection = sqlite3.connect(self.state_db)
-        policy_text = connection.execute(
-            "SELECT sandbox_policy FROM threads WHERE id = 'thread-1'"
-        ).fetchone()[0]
-        policy = json.loads(policy_text)
-        policy["file_system"]["entries"] = {
-            "hidden": {"path": {"type": "path", "path": str(self.old)}}
-        }
-        connection.execute(
-            "UPDATE threads SET sandbox_policy = ? WHERE id = 'thread-1'",
-            (json.dumps(policy, ensure_ascii=False, separators=(",", ":")),),
-        )
-        connection.commit()
-        connection.close()
-
-        result, payload = self.plan()
-
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(payload["status"], "unsafe-refused")
-        self.assertIn("outside the write allowlist", payload["error"])
-        self.assertTrue(self.old.is_dir())
-        self.assertFalse(self.new.exists())
-
-    def test_policy_object_key_cannot_hide_an_old_path(self) -> None:
-        connection = sqlite3.connect(self.state_db)
-        policy_text = connection.execute(
-            "SELECT sandbox_policy FROM threads WHERE id = 'thread-1'"
-        ).fetchone()[0]
-        policy = json.loads(policy_text)
-        policy["future_path_map"] = {str(self.old): {"access": "write"}}
-        connection.execute(
-            "UPDATE threads SET sandbox_policy = ? WHERE id = 'thread-1'",
-            (json.dumps(policy, ensure_ascii=False, separators=(",", ":")),),
-        )
-        connection.commit()
-        connection.close()
-
-        result, payload = self.plan()
-
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(payload["status"], "unsafe-refused")
-        self.assertIn("outside the write allowlist", payload["error"])
-        self.assertIn("#key", json.dumps(payload["details"]))
-        self.assertTrue(self.old.is_dir())
-        self.assertFalse(self.new.exists())
-
-    def test_nonfinite_global_number_blocks_before_mutation(self) -> None:
-        raw = self.global_state.read_text(encoding="utf-8")
-        self.global_state.write_text(
-            raw[:-1] + ',"overflow":1e999}',
-            encoding="utf-8",
-        )
-
-        result, payload = self.plan()
-
-        self.assertEqual(result.returncode, 0)
-        self.assertEqual(payload["status"], "blocked")
-        self.assertIsNone(payload["apply_token"])
-        self.assertIn("non-finite JSON number", " ".join(payload["metadata"]["audit_errors"]))
-        self.assertTrue(self.old.is_dir())
-        self.assertFalse(self.new.exists())
-
-    def test_precision_losing_global_number_blocks_before_mutation(self) -> None:
-        raw = self.global_state.read_text(encoding="utf-8")
-        self.global_state.write_text(
-            raw[:-1] + ',"precise":0.123456789012345678901234567890}',
-            encoding="utf-8",
-        )
-
-        result, payload = self.plan()
-
-        self.assertEqual(result.returncode, 0)
-        self.assertEqual(payload["status"], "blocked")
-        self.assertIsNone(payload["apply_token"])
-        self.assertIn("precision loss", " ".join(payload["metadata"]["audit_errors"]))
-        self.assertTrue(self.old.is_dir())
-        self.assertFalse(self.new.exists())
-
-    def test_nonfinite_policy_number_is_refused_before_mutation(self) -> None:
-        connection = sqlite3.connect(self.state_db)
-        policy_text = connection.execute(
-            "SELECT sandbox_policy FROM threads WHERE id = 'thread-1'"
-        ).fetchone()[0]
-        connection.execute(
-            "UPDATE threads SET sandbox_policy = ? WHERE id = 'thread-1'",
-            (policy_text[:-1] + ',"overflow":1e999}',),
-        )
-        connection.commit()
-        connection.close()
-
-        result, payload = self.plan()
-
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(payload["status"], "unsafe-refused")
-        self.assertIn("non-finite JSON number", payload["error"])
-        self.assertTrue(self.old.is_dir())
-        self.assertFalse(self.new.exists())
-
-    def test_precision_losing_policy_number_is_refused_before_mutation(self) -> None:
-        connection = sqlite3.connect(self.state_db)
-        policy_text = connection.execute(
-            "SELECT sandbox_policy FROM threads WHERE id = 'thread-1'"
-        ).fetchone()[0]
-        connection.execute(
-            "UPDATE threads SET sandbox_policy = ? WHERE id = 'thread-1'",
-            (
-                policy_text[:-1]
-                + ',"precise":0.123456789012345678901234567890}',
-            ),
-        )
-        connection.commit()
-        connection.close()
-
-        result, payload = self.plan()
-
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(payload["status"], "unsafe-refused")
-        self.assertIn("precision loss", payload["error"])
-        self.assertTrue(self.old.is_dir())
-        self.assertFalse(self.new.exists())
-
-
-class TransactionTests(RelocateFixture):
-    def test_large_session_history_is_streamed_and_preserved(self) -> None:
-        history_chunk = b'{"type":"response_item","payload":"history"}\n' * 25000
-        expected_history = hashlib.sha256()
-        expected_history.update(self.history_line.encode("utf-8"))
-        with self.session.open("ab") as handle:
-            for _ in range(12):
-                handle.write(history_chunk)
-                expected_history.update(history_chunk)
-
-        _, planned = self.plan()
-        spec = importlib.util.spec_from_file_location("relocate_stream_test", SCRIPT)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        original_read_bytes = Path.read_bytes
-
-        def guarded_read_bytes(candidate: Path) -> bytes:
-            if candidate == self.session:
-                raise AssertionError("session JSONL must not be loaded with read_bytes")
-            return original_read_bytes(candidate)
-
-        args = SimpleNamespace(
-            old=str(self.old),
-            new=str(self.new),
-            codex_home=str(self.codex_home),
-            state_db=None,
-            token=planned["apply_token"],
-            without_link=False,
-        )
-        with mock.patch.object(Path, "read_bytes", guarded_read_bytes):
-            with contextlib.redirect_stdout(io.StringIO()):
-                result = module.apply_command(args)
-
-        self.assertEqual(result, 0)
-        actual_history = hashlib.sha256()
-        with self.session.open("rb") as handle:
-            handle.readline()
-            while True:
-                chunk = handle.read(1024 * 1024)
-                if not chunk:
-                    break
-                actual_history.update(chunk)
-        self.assertEqual(actual_history.hexdigest(), expected_history.hexdigest())
-        self.assertTrue(self.old.is_symlink())
-        self.assertTrue(self.new.is_dir())
-
-    def test_parent_fsync_failure_is_retried_before_metadata_commit(self) -> None:
-        _, planned = self.plan()
-        spec = importlib.util.spec_from_file_location("relocate_fsync_test", SCRIPT)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        original_rename = module.atomic_exclusive_rename
-        original_recovery_sync = module.fsync_proven_parent_directories
-        real_fsync = os.fsync
-        context = {"rename": False, "recovery": False}
-        failures = {"rename": True, "recovery": True}
-
-        def flaky_fsync(descriptor: int) -> None:
-            for phase in ("rename", "recovery"):
-                if context[phase] and failures[phase]:
-                    failures[phase] = False
-                    raise OSError(f"simulated {phase} directory fsync failure")
-            real_fsync(descriptor)
-
-        def wrapped_rename(*args, **kwargs):
-            context["rename"] = True
-            try:
-                return original_rename(*args, **kwargs)
-            finally:
-                context["rename"] = False
-
-        def wrapped_recovery_sync(*args, **kwargs):
-            context["recovery"] = True
-            try:
-                return original_recovery_sync(*args, **kwargs)
-            finally:
-                context["recovery"] = False
-
-        args = SimpleNamespace(
-            old=str(self.old),
-            new=str(self.new),
-            codex_home=str(self.codex_home),
-            state_db=None,
-            token=planned["apply_token"],
-            without_link=False,
-        )
-        with mock.patch.object(module.os, "fsync", side_effect=flaky_fsync):
-            with mock.patch.object(
-                module,
-                "atomic_exclusive_rename",
-                side_effect=wrapped_rename,
-            ):
-                with mock.patch.object(
-                    module,
-                    "fsync_proven_parent_directories",
-                    side_effect=wrapped_recovery_sync,
-                ):
-                    with self.assertRaises(module.PartialFailure):
-                        module.apply_command(args)
-                    self.assertFalse(self.old.exists())
-                    self.assertTrue(self.new.is_dir())
-
-                    with self.assertRaises(module.PartialFailure):
-                        module.apply_command(args)
-                    connection = sqlite3.connect(self.state_db)
-                    cwd = connection.execute(
-                        "SELECT cwd FROM threads WHERE id = 'thread-1'"
-                    ).fetchone()[0]
-                    connection.close()
-                    self.assertEqual(cwd, str(self.old))
-                    self.assertFalse(self.old.exists())
-
-                    with contextlib.redirect_stdout(io.StringIO()):
-                        result = module.apply_command(args)
-
-        self.assertEqual(result, 0)
-        self.assertTrue(self.old.is_symlink())
-        self.assertTrue(self.new.is_dir())
-
-    def test_escaped_lone_surrogates_are_preserved_without_partial_failure(self) -> None:
-        state = json.loads(self.global_state.read_text(encoding="utf-8"))
-        state["unrelated-surrogate"] = "\ud800"
-        self.global_state.write_text(
-            json.dumps(state, ensure_ascii=True, separators=(",", ":")),
-            encoding="utf-8",
-        )
-
-        connection = sqlite3.connect(self.state_db)
-        policy_text = connection.execute(
-            "SELECT sandbox_policy FROM threads WHERE id = 'thread-1'"
-        ).fetchone()[0]
-        policy = json.loads(policy_text)
-        policy["unrelated-surrogate"] = "\ud800"
-        connection.execute(
-            "UPDATE threads SET sandbox_policy = ? WHERE id = 'thread-1'",
-            (json.dumps(policy, ensure_ascii=True, separators=(",", ":")),),
-        )
-        connection.commit()
-        connection.close()
-
-        planned_result, planned = self.plan()
-        self.assertEqual(planned_result.returncode, 0)
-        self.assertEqual(planned["status"], "ready")
-
-        result, payload = self.run_script(
-            "apply",
-            str(self.old),
-            str(self.new),
-            "--token",
-            planned["apply_token"],
-        )
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(payload["status"], "completed")
-        repaired_state = json.loads(self.global_state.read_text(encoding="utf-8"))
-        self.assertEqual(repaired_state["unrelated-surrogate"], "\ud800")
-        connection = sqlite3.connect(self.state_db)
-        repaired_policy = json.loads(
-            connection.execute(
-                "SELECT sandbox_policy FROM threads WHERE id = 'thread-1'"
-            ).fetchone()[0]
-        )
-        connection.close()
-        self.assertEqual(repaired_policy["unrelated-surrogate"], "\ud800")
-
-    def test_apply_moves_repairs_backs_up_and_verifies(self) -> None:
-        _, planned = self.plan()
-        token = planned["apply_token"]
-        result, payload = self.run_script(
-            "apply", str(self.old), str(self.new), "--token", token
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(payload["status"], "completed")
-        self.assertTrue(self.old.is_symlink())
-        self.assertEqual(self.old.resolve(), self.new.resolve())
-        self.assertEqual((self.new / "payload.txt").read_text(), "unchanged\n")
-
-        connection = sqlite3.connect(self.state_db)
-        cwd, policy_text = connection.execute(
-            "SELECT cwd, sandbox_policy FROM threads WHERE id = 'thread-1'"
-        ).fetchone()
-        connection.close()
-        self.assertEqual(cwd, str(self.new))
-        policy = json.loads(policy_text)
-        policy_paths = [
-            entry["path"]["path"]
-            for entry in policy["file_system"]["entries"]
-            if entry["path"]["type"] == "path"
-        ]
-        self.assertIn(str(self.new), policy_paths)
-        self.assertIn(str(self.new / ".git"), policy_paths)
-        self.assertNotIn(str(self.old), policy_paths)
-
-        lines = self.session.read_text(encoding="utf-8").splitlines(keepends=True)
-        self.assertEqual(json.loads(lines[0])["payload"]["cwd"], str(self.new))
-        self.assertEqual(lines[1], self.history_line)
-        global_state = json.loads(self.global_state.read_text(encoding="utf-8"))
-        self.assertEqual(global_state["electron-saved-workspace-roots"], [str(self.new)])
-        self.assertEqual(
-            global_state["prompt-history"]["thread-1"],
-            [f"Historical prose keeps {self.old} unchanged"],
-        )
-        self.assertEqual(
-            global_state["thread-writable-roots"]["thread-1"],
-            [str(self.new), str(self.root / "extra")],
-        )
-
-        backup_root = self.codex_home / "relocation-backups"
-        backups = list(backup_root.iterdir())
-        self.assertEqual(len(backups), 1)
-        manifest = json.loads((backups[0] / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["status"], "completed")
-
-        verify, verified = self.run_script(
-            "verify", str(self.old), str(self.new), "--token", token
-        )
-        self.assertEqual(verify.returncode, 0, verify.stderr)
-        self.assertEqual(verified["status"], "verified")
-        self.assertEqual(verified["metadata"]["change_count"], 0)
-
-    def test_apply_resumes_after_move_before_link(self) -> None:
-        _, planned = self.plan()
-        token = planned["apply_token"]
-        os.rename(self.old, self.new)
-        result, payload = self.run_script(
-            "apply", str(self.old), str(self.new), "--token", token
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(payload["filesystem"]["status"], "resumed")
-        self.assertTrue(self.old.is_symlink())
-
-    def test_repeating_apply_is_a_noop(self) -> None:
-        _, planned = self.plan()
-        token = planned["apply_token"]
-        first, _ = self.run_script(
-            "apply", str(self.old), str(self.new), "--token", token
-        )
-        self.assertEqual(first.returncode, 0)
-        backup_count = len(list((self.codex_home / "relocation-backups").iterdir()))
-        second, payload = self.run_script(
-            "apply", str(self.old), str(self.new), "--token", token
-        )
-        self.assertEqual(second.returncode, 0)
-        self.assertEqual(payload["status"], "already-complete")
-        self.assertEqual(
-            backup_count, len(list((self.codex_home / "relocation-backups").iterdir()))
-        )
-
-    def test_linkless_apply_requires_matching_policy_and_verifies(self) -> None:
-        planned_result, planned = self.run_script(
-            "plan", str(self.old), str(self.new), "--without-link"
-        )
-        self.assertEqual(planned_result.returncode, 0)
-        token = planned["apply_token"]
-        applied, payload = self.run_script(
-            "apply",
-            str(self.old),
-            str(self.new),
-            "--token",
-            token,
-            "--without-link",
-        )
-        self.assertEqual(applied.returncode, 0, applied.stderr)
-        self.assertEqual(payload["status"], "completed")
-        self.assertFalse(os.path.lexists(self.old))
-        self.assertTrue(self.new.is_dir())
-        verified, verify_payload = self.run_script(
-            "verify",
-            str(self.old),
-            str(self.new),
-            "--token",
-            token,
-            "--without-link",
-        )
-        self.assertEqual(verified.returncode, 0, verified.stderr)
-        self.assertEqual(verify_payload["status"], "verified")
-
-    def test_open_state_database_refuses_before_move(self) -> None:
-        _, planned = self.plan()
-        connection = sqlite3.connect(self.state_db)
-        try:
-            result, payload = self.run_script(
-                "apply",
-                str(self.old),
-                str(self.new),
-                "--token",
-                planned["apply_token"],
-            )
-        finally:
-            connection.close()
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("still using the state database", payload["error"])
-        self.assertTrue(self.old.is_dir())
-        self.assertFalse(self.new.exists())
-
-    def test_missing_related_rollout_blocks_plan(self) -> None:
-        self.session.unlink()
-
-        result, payload = self.plan()
-
-        self.assertEqual(result.returncode, 0)
-        self.assertEqual(payload["status"], "blocked")
-        self.assertIsNone(payload["apply_token"])
-        self.assertFalse(payload["metadata"]["audit_complete"])
-        self.assertIn("rollout_path is absent", " ".join(payload["metadata"]["audit_errors"]))
-
-    def test_symlinked_session_subtree_is_refused(self) -> None:
-        external = self.root / "external-sessions"
-        external.mkdir()
-        link = self.codex_home / "sessions" / "linked-external"
-        link.symlink_to(external, target_is_directory=True)
-
-        result, payload = self.plan()
-
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(payload["status"], "unsafe-refused")
-        self.assertIn("contains a symlink", payload["error"])
-
-    def test_global_allowlist_type_drift_blocks_plan(self) -> None:
-        state = json.loads(self.global_state.read_text(encoding="utf-8"))
-        state["electron-saved-workspace-roots"] = str(self.old)
-        self.global_state.write_text(
-            json.dumps(state, ensure_ascii=False, separators=(",", ":")),
-            encoding="utf-8",
-        )
-
-        result, payload = self.plan()
-
-        self.assertEqual(result.returncode, 0)
-        self.assertEqual(payload["status"], "blocked")
-        self.assertIsNone(payload["apply_token"])
-        self.assertIn("is not a list", " ".join(payload["metadata"]["audit_errors"]))
-
-    def test_wal_header_without_sidecars_is_audited_read_only(self) -> None:
-        connection = sqlite3.connect(self.state_db)
-        mode = connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
-        connection.close()
-        self.assertEqual(str(mode).lower(), "wal")
-
-        result, payload = self.plan()
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(payload["status"], "ready")
-        self.assertTrue(payload["metadata"]["audit_complete"])
-
-    def test_codex_home_nested_inside_source_is_refused(self) -> None:
-        nested_home = self.old / "codex-home"
-        self.codex_home.rename(nested_home)
-        self.codex_home = nested_home
-        self.state_db = nested_home / "state_5.sqlite"
-        self.global_state = nested_home / ".codex-global-state.json"
-        self.session = nested_home / self.session.relative_to(self.root / "codex-home")
-
-        result, payload = self.plan()
-
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(payload["status"], "unsafe-refused")
-        self.assertIn("must not contain one another", payload["error"])
-        self.assertTrue(self.old.is_dir())
-        self.assertFalse(self.new.exists())
-
-    def test_metadata_only_repair_is_idempotent(self) -> None:
-        os.rename(self.old, self.new)
-        os.symlink(str(self.new), str(self.old), target_is_directory=True)
-        planned_result, planned = self.run_script("repair", str(self.old), str(self.new))
-        self.assertEqual(planned_result.returncode, 0)
-        self.assertEqual(planned["status"], "repair-ready")
-        token = planned["repair_apply_token"]
-        applied, payload = self.run_script(
-            "repair", str(self.old), str(self.new), "--token", token
-        )
-        self.assertEqual(applied.returncode, 0, applied.stderr)
-        self.assertEqual(payload["status"], "completed")
-        second, second_payload = self.run_script("repair", str(self.old), str(self.new))
-        self.assertEqual(second.returncode, 0)
-        self.assertEqual(second_payload["status"], "clean")
-        self.assertEqual(second_payload["metadata"]["change_count"], 0)
-
-    def test_repair_token_rejects_replaced_destination_identity(self) -> None:
-        os.rename(self.old, self.new)
-        os.symlink(str(self.new), str(self.old), target_is_directory=True)
-        _, planned = self.run_script("repair", str(self.old), str(self.new))
-        token = planned["repair_apply_token"]
-        before = {
-            "db": digest(self.state_db),
-            "session": digest(self.session),
-            "global": digest(self.global_state),
-        }
-        displaced = self.root / "approved-destination"
-        os.rename(self.new, displaced)
-        self.new.mkdir()
-
-        result, payload = self.run_script(
-            "repair",
-            str(self.old),
-            str(self.new),
-            "--token",
-            token,
-        )
-
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(payload["status"], "unsafe-refused")
-        self.assertIn("identity changed", payload["error"])
-        self.assertEqual(before["db"], digest(self.state_db))
-        self.assertEqual(before["session"], digest(self.session))
-        self.assertEqual(before["global"], digest(self.global_state))
-
-    def test_repair_rechecks_destination_after_backup_before_writes(self) -> None:
-        os.rename(self.old, self.new)
-        os.symlink(str(self.new), str(self.old), target_is_directory=True)
-        _, planned = self.run_script("repair", str(self.old), str(self.new))
-        before = {
-            "db": digest(self.state_db),
-            "session": digest(self.session),
-            "global": digest(self.global_state),
-        }
-        spec = importlib.util.spec_from_file_location("relocate_repair_race_test", SCRIPT)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        original_prepare = module.prepare_metadata_backup
-        displaced = self.root / "approved-destination"
-
-        def replace_after_backup(*args, **kwargs):
-            prepared = original_prepare(*args, **kwargs)
-            os.rename(self.new, displaced)
-            self.new.mkdir()
-            return prepared
-
-        args = SimpleNamespace(
-            old=str(self.old),
-            new=str(self.new),
-            codex_home=str(self.codex_home),
-            state_db=None,
-            token=planned["repair_apply_token"],
-            without_link=False,
-        )
-        with mock.patch.object(
-            module,
-            "prepare_metadata_backup",
-            side_effect=replace_after_backup,
-        ):
-            with self.assertRaises(module.Refusal) as raised:
-                module.repair_command(args)
-
-        self.assertIn("identity changed", str(raised.exception))
-        self.assertEqual(before["db"], digest(self.state_db))
-        self.assertEqual(before["session"], digest(self.session))
-        self.assertEqual(before["global"], digest(self.global_state))
-        self.assertFalse((self.codex_home / "relocation-backups").exists())
-
-    def test_apply_rechecks_destination_before_metadata_writes(self) -> None:
-        _, planned = self.plan()
-        before = {
-            "db": digest(self.state_db),
-            "session": digest(self.session),
-            "global": digest(self.global_state),
-        }
-        spec = importlib.util.spec_from_file_location("relocate_apply_race_test", SCRIPT)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        original_apply_filesystem = module.apply_filesystem
-        displaced = self.root / "approved-destination"
-
-        def replace_after_filesystem(*args, **kwargs):
-            result = original_apply_filesystem(*args, **kwargs)
-            os.rename(self.new, displaced)
-            self.new.mkdir()
-            return result
-
-        args = SimpleNamespace(
-            old=str(self.old),
-            new=str(self.new),
-            codex_home=str(self.codex_home),
-            state_db=None,
-            token=planned["apply_token"],
-            without_link=False,
-        )
-        with mock.patch.object(
-            module,
-            "apply_filesystem",
-            side_effect=replace_after_filesystem,
-        ):
-            with self.assertRaises(module.PartialFailure) as raised:
-                module.apply_command(args)
-
-        self.assertIn(
-            "destination",
-            json.dumps(raised.exception.details).lower(),
-        )
-        self.assertEqual(before["db"], digest(self.state_db))
-        self.assertEqual(before["session"], digest(self.session))
-        self.assertEqual(before["global"], digest(self.global_state))
-        self.assertTrue((self.codex_home / "relocation-backups").is_dir())
-
-    def test_backup_preparation_failure_refuses_before_move(self) -> None:
-        _, planned = self.plan()
-        before = {
-            "db": digest(self.state_db),
-            "session": digest(self.session),
-            "global": digest(self.global_state),
-        }
-        (self.codex_home / "relocation-backups").write_text(
-            "not a directory\n", encoding="utf-8"
-        )
-
-        result, payload = self.run_script(
-            "apply",
-            str(self.old),
-            str(self.new),
-            "--token",
-            planned["apply_token"],
-        )
-
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(payload["status"], "unsafe-refused")
-        self.assertTrue(self.old.is_dir())
-        self.assertFalse(self.new.exists())
-        self.assertEqual(before["db"], digest(self.state_db))
-        self.assertEqual(before["session"], digest(self.session))
-        self.assertEqual(before["global"], digest(self.global_state))
-
-    def test_missing_lsof_refuses_before_move(self) -> None:
-        _, planned = self.plan()
-        empty_path = self.root / "empty-bin"
-        empty_path.mkdir()
-
-        with mock.patch.dict(os.environ, {"PATH": str(empty_path)}):
-            result, payload = self.run_script(
-                "apply",
-                str(self.old),
-                str(self.new),
-                "--token",
-                planned["apply_token"],
-            )
-
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("lsof", payload["error"])
-        self.assertTrue(self.old.is_dir())
-        self.assertFalse(self.new.exists())
-
-    def test_open_wal_sidecar_refuses_before_move(self) -> None:
-        wal = Path(f"{self.state_db}-wal")
-        wal.touch()
-        _, planned = self.plan()
-        self.assertTrue(wal.exists())
-
-        holder = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                (
-                    "import sys; "
-                    "handle = open(sys.argv[1], 'rb'); "
-                    "print('ready', flush=True); "
-                    "sys.stdin.read()"
-                ),
-                str(wal),
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        try:
-            assert holder.stdout is not None
-            self.assertEqual(holder.stdout.readline().strip(), "ready")
-            result, payload = self.run_script(
-                "apply",
-                str(self.old),
-                str(self.new),
-                "--token",
-                planned["apply_token"],
-            )
-        finally:
-            assert holder.stdin is not None
-            holder.stdin.close()
-            holder.wait(timeout=5)
-            assert holder.stdout is not None
-            assert holder.stderr is not None
-            holder.stdout.close()
-            holder.stderr.close()
-
-        self.assertEqual(result.returncode, 2)
-        self.assertIn(str(wal), json.dumps(payload, ensure_ascii=False))
-        self.assertTrue(self.old.is_dir())
-        self.assertFalse(self.new.exists())
-
-    def test_plan_does_not_touch_residual_wal_or_shm_and_apply_succeeds(self) -> None:
-        writer = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                (
-                    "import os, sqlite3, sys; "
-                    "connection = sqlite3.connect(sys.argv[1]); "
-                    "connection.execute('PRAGMA journal_mode=WAL'); "
-                    "connection.execute('PRAGMA wal_autocheckpoint=0'); "
-                    "connection.execute('CREATE TABLE IF NOT EXISTS wal_marker(value TEXT)'); "
-                    "connection.execute(\"INSERT INTO wal_marker VALUES ('committed')\"); "
-                    "connection.commit(); "
-                    "os._exit(0)"
-                ),
-                str(self.state_db),
-            ],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        self.assertEqual(writer.returncode, 0, writer.stderr)
-        wal = Path(f"{self.state_db}-wal")
-        shm = Path(f"{self.state_db}-shm")
-        self.assertTrue(wal.is_file())
-        self.assertTrue(shm.is_file())
-        before = {
-            "wal": (digest(wal), wal.stat().st_mtime_ns),
-            "shm": (digest(shm), shm.stat().st_mtime_ns),
-        }
-
-        planned_result, planned = self.plan()
-
-        self.assertEqual(planned_result.returncode, 0, planned_result.stderr)
-        self.assertEqual(planned["status"], "ready")
-        self.assertEqual(before["wal"], (digest(wal), wal.stat().st_mtime_ns))
-        self.assertEqual(before["shm"], (digest(shm), shm.stat().st_mtime_ns))
-        result, payload = self.run_script(
-            "apply",
-            str(self.old),
-            str(self.new),
-            "--token",
-            planned["apply_token"],
-        )
-        self.assertEqual(
-            result.returncode,
-            0,
-            json.dumps(payload, ensure_ascii=False, sort_keys=True),
-        )
-        self.assertEqual(payload["status"], "completed")
-        backup_db = (
-            Path(payload["metadata"]["backup"])
-            / "files"
-            / self.state_db.relative_to(self.codex_home)
-        )
-        backup_connection = sqlite3.connect(backup_db)
-        try:
-            marker_count = backup_connection.execute(
-                "SELECT COUNT(*) FROM wal_marker WHERE value = 'committed'"
-            ).fetchone()[0]
-        finally:
-            backup_connection.close()
-        self.assertEqual(marker_count, 1)
-
-    def test_verify_fails_when_destination_identity_was_replaced(self) -> None:
-        _, planned = self.plan()
-        token = planned["apply_token"]
-        applied, _ = self.run_script(
-            "apply", str(self.old), str(self.new), "--token", token
-        )
-        self.assertEqual(applied.returncode, 0)
-
-        original = self.root / "original-planned-directory"
-        os.rename(self.new, original)
-        self.new.mkdir()
-        (self.new / "impostor.txt").write_text("replacement\n", encoding="utf-8")
-
-        result, payload = self.run_script(
-            "verify", str(self.old), str(self.new), "--token", token
-        )
-
-        self.assertEqual(result.returncode, 4)
-        self.assertEqual(payload["status"], "verification-failed")
-        self.assertFalse(payload["identity_verified_by_token"])
-
-    def test_linkless_apply_refuses_existing_compatibility_link(self) -> None:
-        planned_result, planned = self.run_script(
-            "plan", str(self.old), str(self.new), "--without-link"
-        )
-        self.assertEqual(planned_result.returncode, 0)
-        os.rename(self.old, self.new)
-        os.symlink(str(self.new), str(self.old), target_is_directory=True)
-        before = {
-            "db": digest(self.state_db),
-            "session": digest(self.session),
-            "global": digest(self.global_state),
-        }
-
-        result, payload = self.run_script(
-            "apply",
-            str(self.old),
-            str(self.new),
-            "--token",
-            planned["apply_token"],
-            "--without-link",
-        )
-
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(payload["status"], "unsafe-refused")
-        self.assertTrue(self.old.is_symlink())
-        self.assertEqual(before["db"], digest(self.state_db))
-        self.assertEqual(before["session"], digest(self.session))
-        self.assertEqual(before["global"], digest(self.global_state))
-
-    def test_exact_repair_token_replay_is_a_noop(self) -> None:
-        os.rename(self.old, self.new)
-        os.symlink(str(self.new), str(self.old), target_is_directory=True)
-        _, planned = self.run_script("repair", str(self.old), str(self.new))
-        token = planned["repair_apply_token"]
-        first, _ = self.run_script(
-            "repair", str(self.old), str(self.new), "--token", token
-        )
-        self.assertEqual(first.returncode, 0)
-        backup_root = self.codex_home / "relocation-backups"
-        backup_count = len(list(backup_root.iterdir()))
-        before = {
-            "db": digest(self.state_db),
-            "session": digest(self.session),
-            "global": digest(self.global_state),
-        }
-
-        second, payload = self.run_script(
-            "repair", str(self.old), str(self.new), "--token", token
-        )
-
-        self.assertEqual(second.returncode, 0)
-        self.assertEqual(payload["status"], "already-complete")
-        self.assertEqual(backup_count, len(list(backup_root.iterdir())))
-        self.assertEqual(before["db"], digest(self.state_db))
-        self.assertEqual(before["session"], digest(self.session))
-        self.assertEqual(before["global"], digest(self.global_state))
-
-    def test_metadata_change_after_plan_refuses_before_move(self) -> None:
-        _, planned = self.plan()
-        state = json.loads(self.global_state.read_text(encoding="utf-8"))
-        state["unrelated-after-plan"] = "changed"
-        self.global_state.write_text(
-            json.dumps(state, ensure_ascii=False, separators=(",", ":")),
-            encoding="utf-8",
-        )
-
-        result, payload = self.run_script(
-            "apply",
-            str(self.old),
-            str(self.new),
-            "--token",
-            planned["apply_token"],
-        )
-
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("changed after planning", payload["error"])
-        self.assertTrue(self.old.is_dir())
-        self.assertFalse(self.new.exists())
-        self.assertFalse((self.codex_home / "relocation-backups").exists())
-
-    def test_global_rewrite_collision_preserves_preexisting_duplicates(self) -> None:
-        extra = str(self.root / "duplicate-extra")
-        state = json.loads(self.global_state.read_text(encoding="utf-8"))
-        state["project-order"] = [str(self.old), str(self.new), extra, extra]
-        self.global_state.write_text(
-            json.dumps(state, ensure_ascii=False, separators=(",", ":")),
-            encoding="utf-8",
-        )
-
-        _, planned = self.plan()
-        project_actions = [
-            change
-            for change in planned["metadata"]["changes"]
-            if change.get("pointer", "").startswith("/project-order/")
-        ]
-        self.assertTrue(
-            any(
-                change.get("operation") == "remove_rewrite_collision"
-                for change in project_actions
-            )
-        )
-        result, _ = self.run_script(
-            "apply",
-            str(self.old),
-            str(self.new),
-            "--token",
-            planned["apply_token"],
-        )
-        self.assertEqual(result.returncode, 0)
-        repaired = json.loads(self.global_state.read_text(encoding="utf-8"))
-        self.assertEqual(repaired["project-order"], [str(self.new), extra, extra])
-
-    def test_apply_with_already_clean_metadata_runs_final_audit(self) -> None:
-        self.make_metadata_clean_for_destination()
-
-        _, planned = self.plan()
-        self.assertEqual(planned["metadata"]["change_count"], 0)
-        result, payload = self.run_script(
-            "apply",
-            str(self.old),
-            str(self.new),
-            "--token",
-            planned["apply_token"],
-        )
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(payload["metadata"]["status"], "clean")
-        self.assertFalse((self.codex_home / "relocation-backups").exists())
-
-    def test_zero_change_apply_detects_old_path_injected_after_move(self) -> None:
-        self.make_metadata_clean_for_destination()
-        _, planned = self.plan()
-        self.assertEqual(planned["metadata"]["change_count"], 0)
-
-        spec = importlib.util.spec_from_file_location("relocate_race_test", SCRIPT)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        original_apply_filesystem = module.apply_filesystem
-
-        def inject_after_move(*args, **kwargs):
-            result = original_apply_filesystem(*args, **kwargs)
-            state = json.loads(self.global_state.read_text(encoding="utf-8"))
-            state["project-order"] = [str(self.old)]
-            self.global_state.write_text(
-                json.dumps(state, ensure_ascii=False, separators=(",", ":")),
-                encoding="utf-8",
-            )
-            return result
-
-        args = SimpleNamespace(
-            old=str(self.old),
-            new=str(self.new),
-            codex_home=str(self.codex_home),
-            state_db=None,
-            token=planned["apply_token"],
-            without_link=False,
-        )
-        with mock.patch.object(
-            module, "apply_filesystem", side_effect=inject_after_move
-        ):
-            with self.assertRaises(module.PartialFailure) as raised:
-                module.apply_command(args)
-
-        self.assertIn("metadata", str(raised.exception).lower())
-        self.assertTrue(self.old.is_symlink())
-        self.assertTrue(self.new.is_dir())
-
-
-class SchemaGuardTests(RelocateFixture):
-    def test_untested_schema_refuses_before_move(self) -> None:
-        connection = sqlite3.connect(self.state_db)
-        connection.execute("UPDATE _sqlx_migrations SET version = 41")
-        connection.commit()
-        connection.close()
-        result, planned = self.plan()
-        self.assertEqual(result.returncode, 0)
-        self.assertEqual(planned["status"], "blocked")
-        self.assertIsNone(planned["apply_token"])
-        self.assertFalse(planned["metadata"]["repair_supported"])
-        self.assertTrue(self.old.is_dir())
-        self.assertFalse(self.new.exists())
+        with self.assertRaises(filesystem.Refusal):
+            self.apply_quiet(recovering=True)
+        self.assertTrue(filesystem.same_object_identity(parked, plan["filesystem"]["source_identity"]))
+        self.assertFalse(self.old.exists())
 
 
 if __name__ == "__main__":
