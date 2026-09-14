@@ -274,11 +274,14 @@ def inspect_plan(plan: dict) -> dict:
     reference = new if state["state"] != "initial" else old
     if not same_object_identity(reference, plan["filesystem"]["source_identity"]):
         raise Refusal("The directory identity no longer matches the original plan.")
+    risks = tree_risks(old, new, tree_root=reference)
     catalog = read_catalog(home, str(old), str(new), plan["catalog"])
-    audit = compare_catalog(plan, catalog)
+    audit = compare_catalog({**plan, "tree_risks": risks}, catalog)
+    audit["conflicts"].extend(f"{r['kind']}: {r['path']}" for r in risks
+                              if r["kind"] != "absolute-link-needs-compatibility")
     complete = state["state"] == "linked" and not audit["conflicts"] and not audit["pending"]
     return {"status": "ready-for-runtime-check" if complete else "verification-pending",
-            "filesystem": state, "audit": audit,
+            "filesystem": state, "audit": audit, "tree_risks": risks,
             "acceptance": "Verify in the desktop and resume representative existing tasks. This helper does not certify UI reload, actual task execution, or permission enforcement.",
             "keep_compatibility_link": True}
 
@@ -296,7 +299,11 @@ def apply_plan(plan_path: Path, *, recovering: bool = False) -> dict:
         if not same_object_identity(root, plan["filesystem"]["source_identity"]):
             raise Refusal("The directory identity no longer matches the original plan.")
         require_quiet_tree(root)
-        if state["state"] == "initial" and tree_risks(old, new) != plan["tree_risks"]:
+        risks = tree_risks(old, new, tree_root=root)
+        if any(r["kind"] != "absolute-link-needs-compatibility" for r in risks):
+            raise Refusal("The move changes link or Git relationships, or they cannot be resolved.",
+                          details={"tree_risks": risks})
+        if state["state"] == "initial" and risks != plan["tree_risks"]:
             raise Refusal("The source's link or Git relationships changed after planning.")
         # Snapshot after the potentially slow process/tree scans, as close as
         # possible to rename. The caller must keep affected work stopped.
