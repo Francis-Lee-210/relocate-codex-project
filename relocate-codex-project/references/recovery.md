@@ -23,7 +23,11 @@ Inspect the actual paths, source identity, conflicts, and pending updates. A rec
 python3 "<skill-dir>/scripts/relocate.py" recover --plan "<absolute-plan-path>"
 ```
 
-Recovery uses the same writer check and no-replace filesystem primitives. It may finish the filesystem stage; it never calls native APIs or certifies task execution. Existing tasks with old cwd/permission paths remain dependent on the link.
+Recovery uses the same writer check and no-replace filesystem primitives. Before creating the compatibility link, it rechecks the tree at its current location, including links inside real `.git` directories and external link chains. A saved plan or receipt does not bypass this check. Verification also reports current link conflicts, even if the filesystem stage already completed.
+
+The audit compares link resolution before and after the move, including the effect of the old-path alias on `..`. Changed targets, cycles, missing intermediate directories, and ambiguous case or Unicode spellings of either relocation root block progress. Safe internal links, stable external links, and dangling final targets remain supported. Resolve the reported relationship before retrying; preserve an existing compatibility link while investigating.
+
+Recovery may finish the filesystem stage; it never calls native APIs or certifies task execution. Existing tasks with old cwd/permission paths remain dependent on the link.
 
 ## When the native edit is incomplete
 

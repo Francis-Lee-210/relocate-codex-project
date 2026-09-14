@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+from collections import deque
 import errno
 import os
 from pathlib import Path
@@ -560,64 +561,117 @@ def apply_filesystem(
     return {"status": "moved", "link_created": compatibility_link}
 
 
-def parent_traversal_after_link(link: Path, target: Path, old: Path) -> bool:
-    """Reject '..' after a symlink, including the future old-path alias.
+def relocation_target(link: Path, old: Path, new: Path, tree_root: Path,
+                      *, after: bool) -> tuple[Path, bool, bool]:
+    """Resolve a link in the before/after namespace using the current tree.
 
-    Lexical normalization cannot model those targets. Ordinary relative
-    links such as '../sibling' remain supported when no symlink is crossed.
+    Expand each symlink before consuming '..', including links outside the
+    project. Project entries are read from tree_root even during recovery;
+    the after namespace adds old -> new, and the before namespace hides new.
+    Return the resolved path, compatibility dependency, and target existence.
     """
-    node = Path(target.anchor) if target.is_absolute() else link.parent
-    crossed_link = False
-    for part in target.parts[1:] if target.is_absolute() else target.parts:
+    namespace_root = new if after else old
+    pending = deque(str(link).split(os.sep))
+    node = Path(os.sep)
+    followed = 0
+    max_links = 32 if sys.platform == "darwin" else 40
+    compatibility = False
+    folded_roots = {unicodedata.normalize("NFC", str(root)).casefold(): root
+                    for root in (old, new)}
+    while pending:
+        part = pending.popleft()
+        if part in ("", "."):
+            continue
         if part == "..":
-            if crossed_link:
-                return True
             node = node.parent
+            continue
+        candidate = node / part
+        equivalent = folded_roots.get(unicodedata.normalize("NFC", str(candidate)).casefold())
+        if equivalent is not None and candidate != equivalent:
+            # A case/normalization alias may name the future compatibility link
+            # on macOS. Do not guess filesystem lookup rules for absent roots.
+            raise Refusal(f"Noncanonical spelling of relocation root: {candidate}")
+        if after and candidate == old:
+            raw = str(new)
+            compatibility = True
         else:
-            node = node / part
-            if node.is_symlink() or (target.is_absolute() and node == old):
-                crossed_link = True
-    return False
+            physical = (tree_root / candidate.relative_to(namespace_root)
+                        if candidate == namespace_root or is_descendant(candidate, namespace_root)
+                        else candidate)
+            try:
+                if not after and candidate == new:
+                    raise FileNotFoundError("Destination does not exist before relocation")
+                info = physical.lstat()
+            except FileNotFoundError:
+                # A dangling leaf is stable if both namespaces agree. Missing
+                # ancestors cannot establish the meaning of subsequent '..'.
+                if pending:
+                    raise Refusal(f"Cannot resolve missing ancestor: {candidate}")
+                return candidate, compatibility, False
+            if not stat.S_ISLNK(info.st_mode):
+                if pending and not stat.S_ISDIR(info.st_mode):
+                    raise Refusal(f"Cannot traverse non-directory: {candidate}")
+                node = candidate
+                continue
+            raw = os.readlink(physical)
+        followed += 1
+        if followed > max_links:
+            raise Refusal(f"Symlink resolution exceeds {max_links} expansions (cycle or excessive chain).")
+        if os.path.isabs(raw):
+            node = Path(os.sep)
+        # Preserve separators and dot components so file/ and file/.. fail.
+        pending.extendleft(reversed(raw.split(os.sep)))
+    return node, compatibility, True
 
 
-def tree_risks(old: Path, new: Path) -> list[dict[str, str]]:
-    """Describe links/Git relationships a directory rename does not repair."""
+def tree_risks(old: Path, new: Path, *, tree_root: Path | None = None) -> list[dict[str, str]]:
+    """Audit links before and after relocation, including real .git directories.
+
+    tree_root is the original tree's current location (old, or new on recovery).
+    Report paths in the original namespace to keep plan comparisons stable.
+    """
     risks: list[dict[str, str]] = []
+    tree_root = old if tree_root is None else tree_root
 
     def walk_error(error: OSError) -> None:
         raise Refusal(f"Cannot inspect the source tree: {error}") from error
 
-    for current, directories, files in os.walk(old, followlinks=False, onerror=walk_error):
+    for current, directories, files in os.walk(tree_root, followlinks=False, onerror=walk_error):
         parent = Path(current)
+        logical_parent = old / parent.relative_to(tree_root)
+        directories.sort()
+        files.sort()
         # A .git directory can own worktrees outside the directory being moved.
         if ".git" in directories:
             git = parent / ".git"
             if git.is_symlink():
-                risks.append({"kind": "git-linked-worktree", "path": str(git)})
+                risks.append({"kind": "git-linked-worktree", "path": str(logical_parent / ".git")})
             elif (git / "worktrees").is_dir() and any((git / "worktrees").iterdir()):
-                risks.append({"kind": "git-external-worktrees", "path": str(git)})
-            directories.remove(".git")
+                risks.append({"kind": "git-external-worktrees", "path": str(logical_parent / ".git")})
         if ".git" in files:
-            risks.append({"kind": "git-linked-worktree", "path": str(parent / ".git")})
+            risks.append({"kind": "git-linked-worktree", "path": str(logical_parent / ".git")})
         for name in directories + files:
             link = parent / name
             if not link.is_symlink():
                 continue
-            raw = os.readlink(link)
-            target = Path(raw)
-            moved_link = new / link.relative_to(old)
-            if parent_traversal_after_link(link, target, old):
-                risks.append({"kind": "symlink-parent-traversal", "path": str(link), "target": raw})
+            logical_link = logical_parent / name
+            moved_link = new / link.relative_to(tree_root)
+            entry = {"path": str(logical_link)}
+            try:
+                raw = os.readlink(link)
+                entry["target"] = raw
+                before, _, existed = relocation_target(logical_link, old, new, tree_root, after=False)
+                after, compatibility, exists = relocation_target(moved_link, old, new, tree_root, after=True)
+            except (OSError, Refusal) as error:
+                risks.append({**entry, "kind": "symlink-resolution-incomplete", "reason": str(error)})
                 continue
-            if target.is_absolute():
-                if any(rewrite_structured_path(p, str(old), str(new)) is not None
-                       for p in (str(target), os.path.realpath(target))):
-                    risks.append({"kind": "absolute-link-needs-compatibility", "path": str(link), "target": raw})
-                continue
-            before = Path(os.path.abspath(link.parent / target))
-            after = Path(os.path.abspath(moved_link.parent / target))
             expected = Path(rewrite_structured_path(str(before), str(old), str(new)) or str(before))
-            if after != expected:
-                risks.append({"kind": "relative-link-changes-target", "path": str(link), "target": raw,
+            if after != expected or existed != exists:
+                kind = "symlink-target-changes" if os.path.isabs(raw) else "relative-link-changes-target"
+                risks.append({**entry, "kind": kind,
                               "before": str(before), "after": str(after)})
+            elif compatibility:
+                # Keep the v2 dependency kind for existing consumers, including
+                # relative links which reach the old alias through other links.
+                risks.append({**entry, "kind": "absolute-link-needs-compatibility"})
     return risks
