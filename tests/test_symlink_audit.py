@@ -105,6 +105,74 @@ class SymlinkAuditTests(RelocateFixture):
         self.assertTrue(self.new.is_dir())
         self.assertEqual(self.store_snapshot(), before)
 
+    def assert_recovery_preserves_paths_on_audit_drift(self) -> None:
+        before = self.store_snapshot()
+        plan_bytes = self.plan_path.read_bytes()
+        with self.assertRaises(filesystem.Refusal):
+            self.apply_quiet(recovering=True)
+        self.assertFalse(os.path.lexists(self.old))
+        self.assertTrue(self.new.is_dir())
+        self.assertFalse(self.receipt.exists())
+        self.assertEqual(self.plan_path.read_bytes(), plan_bytes)
+        self.assertEqual(self.store_snapshot(), before)
+
+    def test_recovery_refuses_changed_compatible_target(self) -> None:
+        (self.old / "config-link").symlink_to(self.old / "payload.txt")
+        self.save_plan()
+        self.old.rename(self.new)
+        (self.new / "config-link").unlink()
+        (self.new / "config-link").symlink_to(self.old / "alternate")
+        self.assert_recovery_preserves_paths_on_audit_drift()
+
+    def test_recovery_refuses_added_compatibility_dependency(self) -> None:
+        self.save_plan()
+        self.old.rename(self.new)
+        (self.new / "config-link").symlink_to(self.old / "payload.txt")
+        self.assert_recovery_preserves_paths_on_audit_drift()
+
+    def test_recovery_refuses_removed_compatibility_dependency(self) -> None:
+        (self.old / "config-link").symlink_to(self.old / "payload.txt")
+        self.save_plan()
+        self.old.rename(self.new)
+        (self.new / "config-link").unlink()
+        self.assert_recovery_preserves_paths_on_audit_drift()
+
+    def test_verify_and_linked_recovery_report_saved_audit_drift(self) -> None:
+        plan = self.moved_plan()
+        self.native_edit_projects()
+        (self.new / "config-link").symlink_to(self.old / "payload.txt")
+        before = self.store_snapshot()
+        receipt_bytes = self.receipt.read_bytes()
+        result = relocate.inspect_plan(plan)
+        self.assertEqual(result["status"], "verification-pending")
+        self.assertTrue(result["audit"]["conflicts"])
+        with self.assertRaises(filesystem.Refusal):
+            self.apply_quiet(recovering=True)
+        self.assertTrue(self.old.is_symlink())
+        self.assertEqual(self.receipt.read_bytes(), receipt_bytes)
+        self.assertEqual(self.store_snapshot(), before)
+        (self.new / "config-link").unlink()
+        self.assertEqual(relocate.inspect_plan(plan)["status"], "ready-for-runtime-check")
+        self.assertEqual(self.apply_quiet(recovering=True)["filesystem"]["status"], "already-complete")
+
+    def test_recovery_accepts_unchanged_audit_with_different_entry_order(self) -> None:
+        (self.old / "a-file-link").symlink_to(self.old / "payload.txt")
+        (self.old / "z-directory-link").symlink_to(self.old / "src", target_is_directory=True)
+        plan = self.save_plan()
+        self.old.rename(self.new)
+        current = filesystem.tree_risks(self.old, self.new, tree_root=self.new)
+        self.assertNotEqual(current, plan["tree_risks"])
+        before = self.store_snapshot()
+        self.assertEqual(self.apply_quiet(recovering=True)["filesystem"]["status"], "resumed")
+        self.assertEqual((self.new / "a-file-link").read_bytes(), b"keep project contents\n")
+        self.assertTrue((self.new / "z-directory-link").samefile(self.new / "src"))
+        self.assertEqual(self.store_snapshot(), before)
+        self.native_edit_projects()
+        after_native_edit = self.store_snapshot()
+        self.assertEqual(relocate.inspect_plan(plan)["status"], "ready-for-runtime-check")
+        self.assertEqual(self.apply_quiet(recovering=True)["filesystem"]["status"], "already-complete")
+        self.assertEqual(self.store_snapshot(), after_native_edit)
+
     def test_verify_and_linked_recovery_report_current_link_conflicts(self) -> None:
         self.differing_external_files()
         alias = self.root / "external-alias"

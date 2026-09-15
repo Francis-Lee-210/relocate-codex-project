@@ -267,6 +267,15 @@ def compare_catalog(plan: dict, current: dict) -> dict:
     return result
 
 
+def same_tree_risks(current: list[dict], planned: list[dict]) -> bool:
+    """Compare audit contents without os.walk's directory/file entry ordering.
+
+    Before the compatibility alias exists, an unchanged directory symlink can
+    be dangling and consequently appear among files instead of directories.
+    """
+    return sorted(map(canonical_json, current)) == sorted(map(canonical_json, planned))
+
+
 def inspect_plan(plan: dict) -> dict:
     old, new, home = (Path(plan[k]) for k in ("old", "new", "codex_home"))
     validate_static_paths(old, new, home)
@@ -279,6 +288,8 @@ def inspect_plan(plan: dict) -> dict:
     audit = compare_catalog({**plan, "tree_risks": risks}, catalog)
     audit["conflicts"].extend(f"{r['kind']}: {r['path']}" for r in risks
                               if r["kind"] != "absolute-link-needs-compatibility")
+    if not same_tree_risks(risks, plan["tree_risks"]):
+        audit["conflicts"].append("The project's link or Git relationships changed after planning.")
     complete = state["state"] == "linked" and not audit["conflicts"] and not audit["pending"]
     return {"status": "ready-for-runtime-check" if complete else "verification-pending",
             "filesystem": state, "audit": audit, "tree_risks": risks,
@@ -303,8 +314,8 @@ def apply_plan(plan_path: Path, *, recovering: bool = False) -> dict:
         if any(r["kind"] != "absolute-link-needs-compatibility" for r in risks):
             raise Refusal("The move changes link or Git relationships, or they cannot be resolved.",
                           details={"tree_risks": risks})
-        if state["state"] == "initial" and risks != plan["tree_risks"]:
-            raise Refusal("The source's link or Git relationships changed after planning.")
+        if not same_tree_risks(risks, plan["tree_risks"]):
+            raise Refusal("The project's link or Git relationships changed after planning.")
         # Snapshot after the potentially slow process/tree scans, as close as
         # possible to rename. The caller must keep affected work stopped.
         current = read_catalog(home, str(old), str(new), plan["catalog"])
