@@ -137,6 +137,36 @@ class SymlinkAuditTests(RelocateFixture):
         (self.new / "config-link").unlink()
         self.assert_recovery_preserves_paths_on_audit_drift()
 
+    def test_recovery_refuses_retargeted_external_compatibility_alias(self) -> None:
+        (self.old / "alternate.txt").write_text("different contents")
+        alias = self.root / "external-alias"
+        alias.symlink_to(self.old / "payload.txt")
+        (self.old / "config-link").symlink_to(alias)
+        self.save_plan()
+        self.old.rename(self.new)
+        alias.unlink()
+        alias.symlink_to(self.old / "alternate.txt")
+        self.assert_recovery_preserves_paths_on_audit_drift()
+
+    def test_older_plan_without_resolved_targets_requires_current_evidence(self) -> None:
+        (self.old / "config-link").symlink_to(self.old / "payload.txt")
+        legacy = self.save_plan()
+        current_plan_bytes = self.plan_path.read_bytes()
+        for risk in legacy["tree_risks"]:
+            risk.pop("before", None)
+            risk.pop("after", None)
+        legacy.pop("plan_id")
+        legacy["plan_id"] = relocate.digest(legacy)
+        self.plan_path.write_bytes(relocate.canonical_json(legacy) + b"\n")
+        with self.assertRaises(filesystem.Refusal):
+            self.apply_quiet()
+        self.assertFalse(self.new.exists())
+        self.old.rename(self.new)
+        self.assert_recovery_preserves_paths_on_audit_drift()
+        # Restore evidence saved before the move, never infer historical targets.
+        self.plan_path.write_bytes(current_plan_bytes)
+        self.assertEqual(self.apply_quiet(recovering=True)["filesystem"]["status"], "resumed")
+
     def test_verify_and_linked_recovery_report_saved_audit_drift(self) -> None:
         plan = self.moved_plan()
         self.native_edit_projects()

@@ -673,5 +673,6 @@ def tree_risks(old: Path, new: Path, *, tree_root: Path | None = None) -> list[d
             elif compatibility:
                 # Keep the v2 dependency kind for existing consumers, including
                 # relative links which reach the old alias through other links.
-                risks.append({**entry, "kind": "absolute-link-needs-compatibility"})
+                risks.append({**entry, "kind": "absolute-link-needs-compatibility",
+                              "before": str(before), "after": str(after)})
     return risks

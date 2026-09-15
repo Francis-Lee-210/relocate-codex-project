@@ -289,7 +289,7 @@ def inspect_plan(plan: dict) -> dict:
     audit["conflicts"].extend(f"{r['kind']}: {r['path']}" for r in risks
                               if r["kind"] != "absolute-link-needs-compatibility")
     if not same_tree_risks(risks, plan["tree_risks"]):
-        audit["conflicts"].append("The project's link or Git relationships changed after planning.")
+        audit["conflicts"].append("The current link or Git audit does not match the saved plan.")
     complete = state["state"] == "linked" and not audit["conflicts"] and not audit["pending"]
     return {"status": "ready-for-runtime-check" if complete else "verification-pending",
             "filesystem": state, "audit": audit, "tree_risks": risks,
@@ -315,7 +315,8 @@ def apply_plan(plan_path: Path, *, recovering: bool = False) -> dict:
             raise Refusal("The move changes link or Git relationships, or they cannot be resolved.",
                           details={"tree_risks": risks})
         if not same_tree_risks(risks, plan["tree_risks"]):
-            raise Refusal("The project's link or Git relationships changed after planning.")
+            raise Refusal("The current link or Git audit does not match the saved plan.",
+                          details={"planned_tree_risks": plan["tree_risks"], "current_tree_risks": risks})
         # Snapshot after the potentially slow process/tree scans, as close as
         # possible to rename. The caller must keep affected work stopped.
         current = read_catalog(home, str(old), str(new), plan["catalog"])
